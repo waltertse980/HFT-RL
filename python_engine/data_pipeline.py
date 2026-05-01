@@ -40,7 +40,7 @@ BASE_DIR = Path(__file__).parent
 DATA_DIR = BASE_DIR / "data"
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 
-US_TICKERS: list[str] = ["AAPL", "NVDA", "TSLA", "SPY", "QQQ"]
+US_TICKERS: list[str] = ["AAPL", "NVDA", "TSLA", "META", "GOOG", "OXY"]
 HK_TICKERS: list[str] = ["0700.HK", "9988.HK", "0005.HK", "2318.HK", "1299.HK"]
 
 SUPPORTED_INTERVALS: list[str] = ["1m", "5m", "1h"]
@@ -98,7 +98,7 @@ def download_us_data(
 
     Parameters
     ----------
-    tickers:  List of US ticker symbols (default: AAPL, NVDA, TSLA, SPY, QQQ).
+    tickers:  List of US ticker symbols (default: AAPL, NVDA, TSLA, META, GOOG, OXY).
     period:   yfinance period string, e.g. '7d', '60d'.
               Note: 1m data is limited to the last 7 days by yfinance.
     interval: One of '1m', '5m', '1h'. For 10s bars call

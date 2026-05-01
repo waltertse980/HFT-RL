@@ -2,7 +2,7 @@
 split_data.py — Temporal 60/30/10 train/val/test split for RL training.
 
 Usage:
-    python split_data.py --ticker NVDA --market us --timescale 1m
+    python split_data.py --ticker NVDA --market us --timescale 5m
     python split_data.py --ticker AAPL --market us --timescale 5m
     python split_data.py --ticker META --market us --timescale 1h
 """

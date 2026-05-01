@@ -17,7 +17,6 @@ import argparse
 import io
 import logging
 import time
-import threading
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional, TypedDict
@@ -61,7 +60,6 @@ logger.info("Training device: %s", DEVICE)
 # Typed return dicts
 # ---------------------------------------------------------------------------
 
-
 class EvalMetrics(TypedDict):
     sharpe: float
     max_drawdown: float
@@ -74,7 +72,6 @@ class EvalMetrics(TypedDict):
 # ---------------------------------------------------------------------------
 # Early-stopping callback
 # ---------------------------------------------------------------------------
-
 
 class EarlyStoppingCallback(BaseCallback):
     """
@@ -129,7 +126,6 @@ class EarlyStoppingCallback(BaseCallback):
 # Data splitting helper
 # ---------------------------------------------------------------------------
 
-
 def _train_test_split(
     data_dict: dict[str, pd.DataFrame],
     test_ratio: float = 0.2,
@@ -146,7 +142,6 @@ def _train_test_split(
 # ---------------------------------------------------------------------------
 # PPO / TD3 configuration builders
 # ---------------------------------------------------------------------------
-
 
 def _build_ppo(
     env,
@@ -168,7 +163,6 @@ def _build_ppo(
         tensorboard_log=tensorboard_log,
         device=DEVICE,
     )
-
 
 def _build_td3(
     env,
@@ -193,7 +187,6 @@ def _build_td3(
 # Main training function
 # ---------------------------------------------------------------------------
 
-
 def train_model(
     market: str,
     timescale: str,
@@ -204,24 +197,6 @@ def train_model(
     initial_capital: float = 100_000.0,
     transaction_cost: float = 0.001,
 ) -> str:
-    """
-    Train a PPO or TD3 RL model on the specified market/timescale dataset.
-
-    Parameters
-    ----------
-    market:           'us' or 'hk'
-    timescale:        '10s', '1m', '5m', '1h'
-    algorithm:        'PPO' or 'TD3'
-    total_timesteps:  Total environment steps for training.
-    n_envs:           Number of parallel SubprocVecEnv workers.
-    window_size:      Observation window (bars).
-    initial_capital:  Starting capital per environment.
-    transaction_cost: Fractional transaction cost (e.g. 0.001 = 10 bps).
-
-    Returns
-    -------
-    Path to the saved model file (str).
-    """
     run_name = f"{market}_{timescale}_{algorithm}"
     tb_log_dir = str(LOGS_DIR / run_name)
     ckpt_dir = MODELS_DIR / run_name
@@ -232,10 +207,6 @@ def train_model(
     train_data, test_data = _train_test_split(data_dict, test_ratio=0.2)
 
     logger.info("Creating training environments (n_envs=%d)...", n_envs)
-    # TD3 does not support SubprocVecEnv well with discrete actions, but
-    # HFTradingEnv has Discrete action space — TD3 requires continuous actions.
-    # For TD3, we wrap via a ContinuousWrapper or use DummyVecEnv with n_envs=1.
-    # PPO works with Discrete + SubprocVecEnv natively.
 
     ticker = next(iter(train_data.keys()))
     df_train = train_data[ticker]
@@ -252,12 +223,12 @@ def train_model(
 
         env_fns = [_env_fn for _ in range(n_envs)]
         vec_env = SubprocVecEnv(env_fns)
+        
+        # Apply normalization to stabilize rewards and observations for PPO
+        vec_env = VecNormalize(vec_env, norm_obs=True, norm_reward=True, clip_reward=10.0)
         model = _build_ppo(vec_env, tb_log_dir)
 
     elif algorithm == "TD3":
-        # TD3 requires continuous action space; we use a single env for simplicity
-        # A ContinuousHFTEnv would be needed for proper multi-env TD3.
-        # For now: DummyVecEnv with a Box-action wrapper.
         logger.warning(
             "TD3 requires a continuous action space. Using single-env DummyVecEnv. "
             "Consider using PPO for better parallel scaling."
@@ -286,6 +257,9 @@ def train_model(
             return Monitor(env)
 
         vec_env = DummyVecEnv([_td3_env_fn])
+        
+        # Apply normalization to TD3 as well
+        vec_env = VecNormalize(vec_env, norm_obs=True, norm_reward=True, clip_reward=10.0)
         model = _build_td3(vec_env, tb_log_dir)
 
     else:
@@ -299,7 +273,7 @@ def train_model(
     )
     early_stop_cb = EarlyStoppingCallback(
         check_freq=10_000,
-        patience=20,   # 200k steps at check_freq=10k
+        patience=20,
         verbose=1,
     )
     callbacks = [checkpoint_cb, early_stop_cb]
@@ -318,15 +292,21 @@ def train_model(
 
     final_path = str(ckpt_dir / "model_final")
     model.save(final_path)
+    
+    # Save the VecNormalize statistics
+    vec_norm_path = str(ckpt_dir / "vec_normalize.pkl")
+    vec_env.save(vec_norm_path)
+    
     logger.info("Model saved → %s.zip", final_path)
+    logger.info("Normalization stats saved → %s", vec_norm_path)
     vec_env.close()
+    
     return final_path + ".zip"
 
 
 # ---------------------------------------------------------------------------
 # ONNX export
 # ---------------------------------------------------------------------------
-
 
 def export_to_onnx(
     model_path: str,
@@ -336,17 +316,8 @@ def export_to_onnx(
 ) -> str:
     """
     Export a Stable-Baselines3 model's policy network to ONNX FP16 (opset 17).
-
-    Parameters
-    ----------
-    model_path:   Path to the .zip SB3 model file.
-    output_path:  Destination .onnx file path.
-    obs_dim:      Observation dimension (window_size × n_features).
-    algorithm:    'PPO' or 'TD3'.
-
-    Returns
-    -------
-    Path to the exported ONNX file.
+    Note: The exported ONNX model expects *normalized* observations if trained 
+    with VecNormalize. In production, you must scale inputs identically.
     """
     logger.info("Loading model from %s", model_path)
     ModelClass = PPO if algorithm == "PPO" else TD3
@@ -376,7 +347,6 @@ def export_to_onnx(
         },
     )
 
-    # Load and convert to FP16
     buffer.seek(0)
     onnx_model = onnx.load_model(buffer)
 
@@ -386,11 +356,9 @@ def export_to_onnx(
         onnx.save(onnx_model_fp16, str(output_path_))
         logger.info("Saved FP16 ONNX model → %s", output_path_)
     except ImportError:
-        # onnxconverter_common not installed — save FP32
         logger.warning("onnxconverter_common not found; saving FP32 ONNX model.")
         onnx.save(onnx_model, str(output_path_))
 
-    # Verify with onnxruntime
     logger.info("Verifying ONNX export with onnxruntime...")
     try:
         sess = ort.InferenceSession(str(output_path_), providers=["CPUExecutionProvider"])
@@ -407,7 +375,6 @@ def export_to_onnx(
 # Evaluation
 # ---------------------------------------------------------------------------
 
-
 def evaluate_model(
     model_path: str,
     test_data: pd.DataFrame,
@@ -416,23 +383,10 @@ def evaluate_model(
     initial_capital: float = 100_000.0,
     n_eval_episodes: int = 5,
 ) -> EvalMetrics:
-    """
-    Run the model on held-out test data and compute trading metrics.
+    
+    model_dir = Path(model_path).parent
+    vec_norm_path = model_dir / "vec_normalize.pkl"
 
-    Parameters
-    ----------
-    model_path:       Path to the .zip SB3 model.
-    test_data:        Feature DataFrame (output of compute_features).
-    algorithm:        'PPO' or 'TD3'.
-    window_size:      Observation window in bars.
-    initial_capital:  Starting capital for evaluation.
-    n_eval_episodes:  Number of evaluation episodes (different random starts).
-
-    Returns
-    -------
-    EvalMetrics TypedDict with sharpe, max_drawdown, win_rate, total_return,
-    n_trades, avg_pnl_per_trade.
-    """
     ModelClass = PPO if algorithm == "PPO" else TD3
     model = ModelClass.load(model_path, device="cpu")
 
@@ -442,28 +396,50 @@ def evaluate_model(
     all_equity_curves: list[list[float]] = []
 
     for ep in range(n_eval_episodes):
-        env = HFTradingEnv(
-            df=test_data,
-            window_size=window_size,
-            initial_capital=initial_capital,
-            transaction_cost=0.001,
-        )
-        obs, _ = env.reset(seed=ep * 42)
-        terminated = truncated = False
-        equity_curve = [initial_capital]
+        def _eval_env_fn():
+            env = HFTradingEnv(
+                df=test_data,
+                window_size=window_size,
+                initial_capital=initial_capital,
+                transaction_cost=0.001,
+            )
+            return Monitor(env)
 
-        while not (terminated or truncated):
+        eval_env = DummyVecEnv([_eval_env_fn])
+        eval_env.seed(ep * 42)
+
+        # Load normalization statistics to ensure inputs match training conditions
+        if vec_norm_path.exists():
+            eval_env = VecNormalize.load(str(vec_norm_path), eval_env)
+            # Disable updates and reward scaling for pure evaluation
+            eval_env.training = False
+            eval_env.norm_reward = False
+
+        obs = eval_env.reset()
+        done = False
+        equity_curve = [initial_capital]
+        final_info = {}
+
+        while not done:
             action, _ = model.predict(obs, deterministic=True)
-            obs, _, terminated, truncated, info = env.step(int(action))
-            equity_curve.append(info["portfolio_value"])
+            obs, reward, dones, infos = eval_env.step(action)
+            
+            done = dones[0]
+            info = infos[0]
+
+            if "portfolio_value" in info:
+                equity_curve.append(info["portfolio_value"])
+            if done:
+                final_info = info
 
         final_value = equity_curve[-1]
         total_return = (final_value - initial_capital) / initial_capital
         all_returns.append(total_return)
-        all_n_trades.append(info["n_trades"])
-        all_pnls.append(info["realized_pnl"])
+        all_n_trades.append(final_info.get("n_trades", 0))
+        all_pnls.append(final_info.get("realized_pnl", 0.0))
         all_equity_curves.append(equity_curve)
-        env.close()
+        
+        eval_env.close()
 
     # Aggregate metrics
     avg_return = float(np.mean(all_returns))
@@ -471,7 +447,6 @@ def evaluate_model(
     avg_pnl = float(np.mean(all_pnls))
     avg_pnl_per_trade = avg_pnl / max(avg_n_trades, 1)
 
-    # Compute Sharpe from the longest equity curve (returns per step)
     longest_curve = max(all_equity_curves, key=len)
     step_returns = np.diff(longest_curve) / (np.array(longest_curve[:-1]) + 1e-8)
     sharpe = float(
@@ -479,13 +454,10 @@ def evaluate_model(
         if len(step_returns) > 1 else 0.0
     )
 
-    # Max drawdown
     curve_arr = np.array(longest_curve)
     running_max = np.maximum.accumulate(curve_arr)
     drawdowns = (running_max - curve_arr) / (running_max + 1e-8)
     max_drawdown = float(np.max(drawdowns))
-
-    # Win rate (fraction of trades with positive P&L — approximate from returns)
     win_rate = float(np.mean([r > 0 for r in all_returns]))
 
     metrics: EvalMetrics = {
@@ -503,7 +475,6 @@ def evaluate_model(
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
-
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="HFT RL Trainer")
@@ -573,7 +544,6 @@ def main() -> None:
 
                 except Exception as exc:  # noqa: BLE001
                     logger.error("Training failed for %s/%s/%s: %s", market, timescale, algo, exc)
-
 
 if __name__ == "__main__":
     main()
