@@ -207,21 +207,18 @@ class HFTradingEnv(gym.Env):
             # Close short if open
             if self._position == POSITION_SHORT:
                 self._realized_pnl += (self._entry_price - current_price) * self._shares_held
-                cost += self.transaction_cost * self._shares_held * current_price
-                self._cash += self._shares_held * current_price - cost
+                
+                cost_to_buy_back = self._shares_held * current_price
+                buy_cost = self.transaction_cost * cost_to_buy_back
+                
+                # You get back the proceeds of the initial short sale, 
+                # minus what it costs to buy the shares back, minus fees.
+                initial_short_proceeds = self._shares_held * self._entry_price
+                self._cash += initial_short_proceeds - cost_to_buy_back - buy_cost
+                
+                cost += buy_cost
                 self._n_trades += 1
                 position_change += 1
-
-            # Open long
-            invest_amount = self._cash * self.max_position
-            self._shares_held = invest_amount / current_price
-            entry_cost = self.transaction_cost * invest_amount
-            self._cash -= invest_amount + entry_cost
-            cost += entry_cost
-            self._position = POSITION_LONG
-            self._entry_price = current_price
-            self._n_trades += 1
-            position_change += 1
 
         elif action == ACTION_SELL and self._position != POSITION_SHORT:
             # Close long if open
@@ -229,7 +226,9 @@ class HFTradingEnv(gym.Env):
                 proceeds = self._shares_held * current_price
                 sell_cost = self.transaction_cost * proceeds
                 self._realized_pnl += (current_price - self._entry_price) * self._shares_held
-                self._cash += proceeds - sell_cost
+                
+                # Add proceeds of selling the long position back to cash
+                self._cash += proceeds - sell_cost 
                 cost += sell_cost
                 self._n_trades += 1
                 position_change += 1
@@ -238,7 +237,13 @@ class HFTradingEnv(gym.Env):
             invest_amount = self._cash * self.max_position
             self._shares_held = invest_amount / current_price
             short_cost = self.transaction_cost * invest_amount
-            self._cash -= short_cost
+            
+            # In a simplified RL margin model:
+            # 1. You receive 'invest_amount' in cash from selling borrowed shares.
+            # 2. You must lock up 'invest_amount' of your own cash as 100% margin.
+            # Net cash change is $0, minus the transaction fee.
+            self._cash -= short_cost 
+            
             cost += short_cost
             self._position = POSITION_SHORT
             self._entry_price = current_price
@@ -247,13 +252,17 @@ class HFTradingEnv(gym.Env):
 
         # --- Mark-to-market portfolio value ---
         if self._position == POSITION_LONG:
-            unrealized = (current_price - self._entry_price) * self._shares_held
-            self._portfolio_value = self._cash + self._shares_held * current_price
+            self._portfolio_value = self._cash + (self._shares_held * current_price)
+
         elif self._position == POSITION_SHORT:
-            unrealized = (self._entry_price - current_price) * self._shares_held
-            self._portfolio_value = self._cash + unrealized
+            # Portfolio = Cash + (Cash received from shorting) - (Cost to buy back today)
+            # self._entry_price * self._shares_held represents the cash received initially
+            cost_to_buy_back = self._shares_held * current_price
+            initial_short_proceeds = self._shares_held * self._entry_price
+            
+            self._portfolio_value = self._cash + initial_short_proceeds - cost_to_buy_back
+
         else:
-            unrealized = 0.0
             self._portfolio_value = self._cash
 
         self._max_portfolio_value = max(self._max_portfolio_value, self._portfolio_value)
