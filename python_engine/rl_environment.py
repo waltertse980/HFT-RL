@@ -291,7 +291,7 @@ class HFTradingEnv(gym.Env):
         
         reward = (
             log_return 
-            - self.transaction_cost * abs(position_change)  # transaction cost penalty
+            # - self.transaction_cost * abs(position_change)  # transaction cost penalty
         )
 
         # --- Termination conditions ---

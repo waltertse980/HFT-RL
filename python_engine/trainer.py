@@ -160,7 +160,7 @@ def _build_ppo(
         gae_lambda=0.95,
         clip_range=0.2,
         ent_coef=0.01,
-        target_kl=0.015,
+        target_kl=0.03,
         normalize_advantage=True,
         verbose=1,
         tensorboard_log=tensorboard_log,
@@ -199,7 +199,7 @@ def train_model(
     n_envs: int = 4,
     window_size: int = 60,
     initial_capital: float = 100_000.0,
-    transaction_cost: float = 0.0001,
+    transaction_cost: float = 0.0,
 ) -> str:
     # Use the first ticker for the run name, or "multi" if more than one
     ticker_tag = target_tickers[0] if len(target_tickers) == 1 else "multi"
@@ -416,7 +416,7 @@ def evaluate_model(
                 df=test_data,
                 window_size=window_size,
                 initial_capital=initial_capital,
-                transaction_cost=0.001,
+                transaction_cost=0.0,
             )
             return Monitor(env)
 
