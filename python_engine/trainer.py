@@ -160,6 +160,7 @@ def _build_ppo(
         clip_range=0.2,
         ent_coef=0.01,
         target_kl=0.015,
+        normalize_advantage=True,
         verbose=1,
         tensorboard_log=tensorboard_log,
         device=DEVICE,

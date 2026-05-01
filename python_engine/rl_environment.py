@@ -290,7 +290,7 @@ class HFTradingEnv(gym.Env):
         drawdown_pct = (self._max_portfolio_value - self._portfolio_value) / (self._max_portfolio_value + 1e-8)
         
         reward = (
-            log_return * 100  # Scale log returns up so the network can "feel" them
+            log_return 
             - self.transaction_cost * abs(position_change)  # transaction cost penalty
             - 0.1 * max(0.0, drawdown_pct)                  # actual drawdown penalty
             - 0.001 * float(action != 0)                    # overtrading penalty
