@@ -152,13 +152,14 @@ def _build_ppo(
         policy="MlpPolicy",
         env=env,
         learning_rate=learning_rate,
-        n_steps=2048,
-        batch_size=64,
+        n_steps=8192,
+        batch_size=512,
         n_epochs=10,
         gamma=0.99,
         gae_lambda=0.95,
         clip_range=0.2,
         ent_coef=0.01,
+        target_kl=0.015,
         verbose=1,
         tensorboard_log=tensorboard_log,
         device=DEVICE,
@@ -195,7 +196,7 @@ def train_model(
     n_envs: int = 4,
     window_size: int = 60,
     initial_capital: float = 100_000.0,
-    transaction_cost: float = 0.001,
+    transaction_cost: float = 0.0001,
 ) -> str:
     run_name = f"{market}_{timescale}_{algorithm}"
     tb_log_dir = str(LOGS_DIR / run_name)

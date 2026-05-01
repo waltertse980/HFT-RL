@@ -120,7 +120,7 @@ class HFTradingEnv(gym.Env):
         df: pd.DataFrame,
         window_size: int = 60,
         initial_capital: float = 100_000.0,
-        transaction_cost: float = 0.001,
+        transaction_cost: float = 0.0001,
         max_position: float = 0.95,
         render_mode: Optional[str] = None,
     ) -> None:
@@ -220,6 +220,17 @@ class HFTradingEnv(gym.Env):
                 self._n_trades += 1
                 position_change += 1
 
+            # Open long
+            invest_amount = self._cash * self.max_position
+            self._shares_held = invest_amount / current_price
+            entry_cost = self.transaction_cost * invest_amount
+            self._cash -= invest_amount + entry_cost
+            cost += entry_cost
+            self._position = POSITION_LONG
+            self._entry_price = current_price
+            self._n_trades += 1
+            position_change += 1
+
         elif action == ACTION_SELL and self._position != POSITION_SHORT:
             # Close long if open
             if self._position == POSITION_LONG:
@@ -238,9 +249,7 @@ class HFTradingEnv(gym.Env):
             self._shares_held = invest_amount / current_price
             short_cost = self.transaction_cost * invest_amount
             
-            # In a simplified RL margin model:
-            # 1. You receive 'invest_amount' in cash from selling borrowed shares.
-            # 2. You must lock up 'invest_amount' of your own cash as 100% margin.
+            # Lock up 'invest_amount' of your own cash as 100% margin.
             # Net cash change is $0, minus the transaction fee.
             self._cash -= short_cost 
             
@@ -250,33 +259,41 @@ class HFTradingEnv(gym.Env):
             self._n_trades += 1
             position_change += 1
 
-        # --- Mark-to-market portfolio value ---
+        # --- Mark-to-market portfolio value & Unrealized PnL ---
         if self._position == POSITION_LONG:
+            unrealized = (current_price - self._entry_price) * self._shares_held
             self._portfolio_value = self._cash + (self._shares_held * current_price)
 
         elif self._position == POSITION_SHORT:
-            # Portfolio = Cash + (Cash received from shorting) - (Cost to buy back today)
-            # self._entry_price * self._shares_held represents the cash received initially
+            unrealized = (self._entry_price - current_price) * self._shares_held
             cost_to_buy_back = self._shares_held * current_price
             initial_short_proceeds = self._shares_held * self._entry_price
-            
             self._portfolio_value = self._cash + initial_short_proceeds - cost_to_buy_back
 
         else:
+            unrealized = 0.0
             self._portfolio_value = self._cash
 
         self._max_portfolio_value = max(self._max_portfolio_value, self._portfolio_value)
         self._portfolio_history.append(self._portfolio_value)
 
-        # --- Reward ---
-        pnl_delta = self._portfolio_value - prev_portfolio
+        # --- Log Returns Reward ---
+        # We calculate the step reward as the log return of the portfolio value.
+        # This provides a bounded, symmetric scale for PnL improvements.
+        # Log(current / previous) = Log(current) - Log(previous)
+        
+        # Ensure we don't log(0) if the portfolio blew up
+        safe_portfolio = max(self._portfolio_value, 1e-8)
+        safe_prev_portfolio = max(prev_portfolio, 1e-8)
+        
+        log_return = np.log(safe_portfolio / safe_prev_portfolio)
         drawdown_pct = (self._max_portfolio_value - self._portfolio_value) / (self._max_portfolio_value + 1e-8)
+        
         reward = (
-            pnl_delta / self.initial_capital  # normalised realized P&L
+            log_return * 100  # Scale log returns up so the network can "feel" them
             - self.transaction_cost * abs(position_change)  # transaction cost penalty
-            - 0.1 * max(0.0, -drawdown_pct)                # drawdown penalty (unused — see below)
             - 0.1 * max(0.0, drawdown_pct)                  # actual drawdown penalty
-            - 0.001 * float(action != ACTION_HOLD)          # overtrading penalty
+            - 0.001 * float(action != 0)                    # overtrading penalty
         )
 
         # --- Termination conditions ---
@@ -286,16 +303,16 @@ class HFTradingEnv(gym.Env):
         )
         truncated = False
 
-        info = StepInfo(
-            portfolio_value=self._portfolio_value,
-            position=self._position,
-            realized_pnl=self._realized_pnl,
-            unrealized_pnl=unrealized,
-            drawdown_pct=drawdown_pct,
-            n_trades=self._n_trades,
-            current_price=current_price,
-            step_idx=self._step_idx,
-        ).to_dict()
+        info = {
+            "portfolio_value": self._portfolio_value,
+            "position": self._position,
+            "realized_pnl": self._realized_pnl,
+            "unrealized_pnl": unrealized,
+            "drawdown_pct": drawdown_pct,
+            "n_trades": self._n_trades,
+            "current_price": current_price,
+            "step_idx": self._step_idx,
+        }
 
         self._step_idx += 1
         obs = self._get_obs()
@@ -370,7 +387,7 @@ class MultiMarketEnv(gym.Env):
         data_dict: dict[str, pd.DataFrame],
         window_size: int = 60,
         initial_capital: float = 100_000.0,
-        transaction_cost: float = 0.001,
+        transaction_cost: float = 0.0001,
         max_position: float = 0.95,
     ) -> None:
         super().__init__()
@@ -442,7 +459,7 @@ def make_envs(
     n_envs: int = 4,
     window_size: int = 60,
     initial_capital: float = 100_000.0,
-    transaction_cost: float = 0.001,
+    transaction_cost: float = 0.0001,
     max_position: float = 0.95,
     multi_market: bool = False,
 ) -> VecEnv:
