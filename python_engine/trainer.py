@@ -9,6 +9,7 @@ Usage
 -----
     python trainer.py --market us --timescale 1m --algo PPO --timesteps 1000000
     python trainer.py --market hk --timescale 10s --algo TD3 --timesteps 500000
+    python trainer.py --market us --timescale 1m --ticker AAPL NVDA
 """
 
 from __future__ import annotations
@@ -36,7 +37,7 @@ from stable_baselines3.common.callbacks import (
 from stable_baselines3.common.monitor import Monitor
 from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv, VecNormalize
 
-from data_pipeline import load_dataset
+from data_pipeline import load_dataset, US_TICKERS, HK_TICKERS
 from rl_environment import HFTradingEnv, make_envs
 
 logger = logging.getLogger(__name__)
@@ -192,6 +193,7 @@ def _build_td3(
 def train_model(
     market: str,
     timescale: str,
+    target_tickers: list[str],
     algorithm: str = "PPO",
     total_timesteps: int = 1_000_000,
     n_envs: int = 4,
@@ -199,17 +201,28 @@ def train_model(
     initial_capital: float = 100_000.0,
     transaction_cost: float = 0.0001,
 ) -> str:
-    run_name = f"{market}_{timescale}_{algorithm}"
+    # Use the first ticker for the run name, or "multi" if more than one
+    ticker_tag = target_tickers[0] if len(target_tickers) == 1 else "multi"
+    run_name = f"{ticker_tag}_{market}_{timescale}_{algorithm}"
+    
     tb_log_dir = str(LOGS_DIR / run_name)
     ckpt_dir = MODELS_DIR / run_name
     ckpt_dir.mkdir(parents=True, exist_ok=True)
 
     logger.info("Loading dataset: market=%s timescale=%s", market, timescale)
     data_dict = load_dataset(market, timescale)
-    train_data, test_data = _train_test_split(data_dict, test_ratio=0.2)
+    
+    # Filter the loaded data dict to only include the user-specified tickers
+    filtered_data_dict = {k: v for k, v in data_dict.items() if k in target_tickers}
+    if not filtered_data_dict:
+        raise ValueError(f"None of the target tickers {target_tickers} were found in the dataset.")
+        
+    train_data, test_data = _train_test_split(filtered_data_dict, test_ratio=0.2)
 
     logger.info("Creating training environments (n_envs=%d)...", n_envs)
 
+    # Note: Currently uses the first ticker in the dict. For multi-ticker training, 
+    # you would need an environment that accepts multiple DFs.
     ticker = next(iter(train_data.keys()))
     df_train = train_data[ticker]
 
@@ -491,6 +504,14 @@ def main() -> None:
         "--export-onnx", action="store_true", help="Export to ONNX after training"
     )
     parser.add_argument("--window-size", type=int, default=60)
+    
+    # Optional ticker list, e.g. --ticker AAPL NVDA
+    parser.add_argument(
+        "--ticker", 
+        nargs="+", 
+        default=None, 
+        help="Space-separated list of tickers. Defaults to all US or HK tickers from data_pipeline."
+    )
     args = parser.parse_args()
 
     markets = ["us", "hk"] if args.market == "both" else [args.market]
@@ -498,15 +519,22 @@ def main() -> None:
     algos = ["PPO", "TD3"] if args.algo == "both" else [args.algo]
 
     for market in markets:
+        # Determine the target tickers for this market loop
+        if args.ticker is not None:
+            target_tickers = args.ticker
+        else:
+            target_tickers = US_TICKERS if market == "us" else HK_TICKERS
+
         for timescale in timescales:
             for algo in algos:
                 logger.info("=" * 60)
-                logger.info("Training: market=%s timescale=%s algo=%s", market, timescale, algo)
+                logger.info("Training: market=%s timescale=%s algo=%s target_tickers=%s", market, timescale, algo, target_tickers)
                 logger.info("=" * 60)
                 try:
                     model_path = train_model(
                         market=market,
                         timescale=timescale,
+                        target_tickers=target_tickers,
                         algorithm=algo,
                         total_timesteps=args.timesteps,
                         n_envs=args.n_envs,
@@ -516,8 +544,10 @@ def main() -> None:
 
                     if args.export_onnx:
                         data_dict = load_dataset(market, timescale)
-                        ticker = next(iter(data_dict.keys()))
-                        df = data_dict[ticker]
+                        # Extract the first valid target ticker for ONNX dims
+                        filtered_dict = {k: v for k, v in data_dict.items() if k in target_tickers}
+                        ticker = next(iter(filtered_dict.keys()))
+                        df = filtered_dict[ticker]
                         from rl_environment import _get_feature_cols
                         n_features = len(_get_feature_cols(df))
                         obs_dim = args.window_size * n_features
@@ -532,8 +562,9 @@ def main() -> None:
 
                     # Quick evaluation
                     data_dict = load_dataset(market, timescale)
-                    ticker = next(iter(data_dict.keys()))
-                    df = data_dict[ticker]
+                    filtered_dict = {k: v for k, v in data_dict.items() if k in target_tickers}
+                    ticker = next(iter(filtered_dict.keys()))
+                    df = filtered_dict[ticker]
                     n = len(df)
                     test_df = df.iloc[int(n * 0.8):]
                     metrics = evaluate_model(
