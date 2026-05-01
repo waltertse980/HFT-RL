@@ -292,8 +292,6 @@ class HFTradingEnv(gym.Env):
         reward = (
             log_return 
             - self.transaction_cost * abs(position_change)  # transaction cost penalty
-            - 0.1 * max(0.0, drawdown_pct)                  # actual drawdown penalty
-            - 0.001 * float(action != 0)                    # overtrading penalty
         )
 
         # --- Termination conditions ---
