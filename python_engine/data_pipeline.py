@@ -25,6 +25,7 @@ from tqdm import tqdm
 from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.requests import StockBarsRequest
 from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
+from alpaca.data.enums import DataFeed  # <-- Added DataFeed
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -89,11 +90,13 @@ def download_us_data(
     result: dict[str, pd.DataFrame] = {}
     
     try:
+        # Added feed=DataFeed.IEX to prevent the 15-minute delayed SIP error on free tiers
         request_params = StockBarsRequest(
             symbol_or_symbols=tickers,
             timeframe=tf,
             start=start_dt,
             end=end_dt,
+            feed=DataFeed.IEX,
         )
         bars = client.get_stock_bars(request_params)
         
