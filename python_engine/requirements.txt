@@ -1,23 +1,66 @@
-gymnasium>=0.29.0
+# ============================================================
+# HFT-RL Python Engine — Requirements
+# Tested on Python 3.10 / 3.11, CUDA 12.x, Windows 11 / Ubuntu 22.04
+# Install: pip install -r requirements.txt
+# For GPU (RTX 3070): ensure CUDA 12 drivers installed first
+# ============================================================
+
+# ── Core RL framework ────────────────────────────────────────
 stable-baselines3>=2.3.0
+gymnasium>=0.29.1
+sb3-contrib>=2.3.0                    # RecurrentPPO (LSTM policies)
+
+# ── Deep learning ───────────────────────────────────────────
+# Install PyTorch separately with CUDA support:
+#   pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
 torch>=2.2.0
-yfinance>=0.2.40
-pandas>=2.0.0
-numpy>=1.26.0
-vectorbt>=0.26.0
+torchvision>=0.17.0
+
+# ── ONNX export & inference ─────────────────────────────────
 onnx>=1.16.0
-onnxruntime>=1.18.0
-websocket-client>=1.8.0
-alpaca-py>=0.23.0
-scipy>=1.13.0
-scikit-learn>=1.5.0
-tensorboard>=2.17.0
-matplotlib>=3.9.0
-requests>=2.32.0
-python-dotenv>=1.0.0
-tqdm>=4.66.0
-rich>=13.7.0
+onnxruntime-gpu>=1.18.0              # GPU inference; use onnxruntime for CPU-only
+onnxconverter-common>=1.13.0        # FP16 conversion
+
+# ── Hyperparameter optimisation ──────────────────────────────
+optuna>=3.6.0
+optuna-dashboard>=0.15.0            # optional: web UI for HPO results
+
+# ── Data & market data ──────────────────────────────────────
+numpy>=1.26.0,<2.0                  # pin <2.0 for SB3 compatibility
+pandas>=2.2.0
+yfinance>=0.2.40                    # fallback market data
+alpaca-py>=0.26.0                   # Alpaca Markets API (US stocks)
+requests>=2.31.0
+websocket-client>=1.7.0
+
+# ── Technical analysis ───────────────────────────────────────
+ta>=0.11.0                          # technical indicator library
+scipy>=1.13.0                       # stats (used in fractional diff, KL)
+
+# ── Backtesting ──────────────────────────────────────────────
+vectorbt>=0.26.0                    # vectorised backtest engine
+
+# ── API server ───────────────────────────────────────────────
 fastapi>=0.111.0
-uvicorn>=0.30.0
+uvicorn[standard]>=0.30.0
 pydantic>=2.7.0
-httpx>=0.27.0
+python-multipart>=0.0.9             # for file upload endpoints
+
+# ── Async ────────────────────────────────────────────────────
+aiohttp>=3.9.5
+anyio>=4.4.0
+
+# ── Logging & monitoring ─────────────────────────────────────
+tensorboard>=2.17.0                 # training curves (SB3 built-in)
+rich>=13.7.0                        # pretty CLI output
+
+# ── Utilities ────────────────────────────────────────────────
+python-dotenv>=1.0.0                # .env file support for API keys
+tqdm>=4.66.0                        # progress bars
+psutil>=5.9.0                       # system resource monitoring
+
+# ── Dev / testing (optional) ─────────────────────────────────
+# pytest>=8.2.0
+# pytest-asyncio>=0.23.0
+# black>=24.4.0
+# ruff>=0.4.0
