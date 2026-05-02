@@ -56,22 +56,25 @@ def split_ticker(ticker: str, market: str, timescale: str,
     # --- Compute cut indices ---
     train_end = int(n * train_pct)
     val_end   = int(n * (train_pct + val_pct))
-    # test_end  = n  (remainder)
 
     train_df = df.iloc[:train_end].copy()
     val_df   = df.iloc[train_end:val_end].copy()
     test_df  = df.iloc[val_end:].copy()
 
     # --- Block-shuffle train segment (5-day blocks) ---
-    # Estimate bars per day from the timescale
-    bars_per_day = {
-        "10s": 2340,  # 6.5h * 360 bars
-        "1m":   390,   # 6.5h * 60 bars
-        "5m":    78,   # 6.5h * 12 bars
-        "1h":     7,   # ~7 trading hours
-    }.get(timescale, 390)
+    # Calculate approximate bars per day based on the frequency to make it universal
+    # Note: A trading day is roughly 6.5 hours (23,400 seconds)
+    rule_map = {"10s": 10, "1m": 60, "5m": 300, "1h": 3600, "1d": 86400, "1w": 604800}
+    sec_per_bar = rule_map.get(timescale, 60)
+    
+    if timescale in ["1d", "1w"]:
+        # For daily and weekly bars, a block size is simply 5 bars
+        block_size = 5
+    else:
+        # For intraday bars, calculate how many bars fit in a 6.5 hour trading day
+        bars_per_day = max(1, 23400 // sec_per_bar)
+        block_size = bars_per_day * 5  # 5-day block
 
-    block_size = bars_per_day * 5  # 5-day block
     rng = np.random.default_rng(seed)
 
     n_train = len(train_df)
@@ -120,7 +123,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="60/30/10 temporal data split")
     parser.add_argument("--ticker",    required=True, help="e.g. NVDA, AAPL, META")
     parser.add_argument("--market",    default="us",  choices=["us", "hk"])
-    parser.add_argument("--timescale", default="1m",  choices=["10s", "1m", "5m", "1h"])
+    parser.add_argument("--timescale", default="1m",  choices=["10s", "1m", "5m", "1h", "1d", "1w"])
     parser.add_argument("--seed",      type=int, default=42, help="RNG seed for block shuffle")
     args = parser.parse_args()
 

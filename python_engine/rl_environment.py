@@ -43,7 +43,6 @@ POSITION_SHORT = -1
 # Structured return types
 # ---------------------------------------------------------------------------
 
-
 @dataclass
 class StepInfo:
     """Extra info dict returned by step()."""
@@ -74,7 +73,8 @@ class StepInfo:
 # ---------------------------------------------------------------------------
 
 def _get_feature_cols(df: pd.DataFrame) -> list[str]:
-    """Return z-score normalised feature columns; fall back to raw OHLCV."""
+    """Return z-score normalised feature columns across all timeframes."""
+    # This will catch z_rsi_14, z_rsi_14_5m, z_macd_1h, etc.
     z_cols = [c for c in df.columns if c.startswith("z_")]
     if z_cols:
         return z_cols
@@ -86,31 +86,18 @@ def _get_feature_cols(df: pd.DataFrame) -> list[str]:
 # HFTradingEnv
 # ---------------------------------------------------------------------------
 
-
 class HFTradingEnv(gym.Env):
     """
-    High-Frequency Trading Environment for 10-second bar RL.
+    High-Frequency Trading Environment.
 
     Observation space
     -----------------
     Rolling window of ``window_size`` bars × N features (normalised OHLCV +
-    technical indicators). Flattened to a 1-D float32 array.
+    technical indicators across ALL available timescales). Flattened to a 1-D array.
 
     Action space
     ------------
     Discrete(3) — 0 = HOLD, 1 = BUY (go long), 2 = SELL (go short)
-
-    Reward function
-    ---------------
-    r = realized_pnl
-        - transaction_cost * |position_change|
-        - 0.1 * max(0, -drawdown_pct)
-        - 0.001 * (action != HOLD)    # discourages overtrading
-
-    Episode termination
-    -------------------
-    - Portfolio value drops below 50 % of initial capital.
-    - Data exhausted (end of DataFrame).
     """
 
     metadata = {"render_modes": ["human", "rgb_array"]}
@@ -136,6 +123,7 @@ class HFTradingEnv(gym.Env):
         self.max_position = max_position
         self.render_mode = render_mode
 
+        # Dynamically size the observation space based on provided dataframe columns
         self._feature_cols: list[str] = _get_feature_cols(df)
         self._n_features: int = len(self._feature_cols)
         self._obs_dim: int = window_size * self._n_features
@@ -207,15 +195,10 @@ class HFTradingEnv(gym.Env):
             # Close short if open
             if self._position == POSITION_SHORT:
                 self._realized_pnl += (self._entry_price - current_price) * self._shares_held
-                
                 cost_to_buy_back = self._shares_held * current_price
                 buy_cost = self.transaction_cost * cost_to_buy_back
-                
-                # You get back the proceeds of the initial short sale, 
-                # minus what it costs to buy the shares back, minus fees.
                 initial_short_proceeds = self._shares_held * self._entry_price
                 self._cash += initial_short_proceeds - cost_to_buy_back - buy_cost
-                
                 cost += buy_cost
                 self._n_trades += 1
                 position_change += 1
@@ -237,8 +220,6 @@ class HFTradingEnv(gym.Env):
                 proceeds = self._shares_held * current_price
                 sell_cost = self.transaction_cost * proceeds
                 self._realized_pnl += (current_price - self._entry_price) * self._shares_held
-                
-                # Add proceeds of selling the long position back to cash
                 self._cash += proceeds - sell_cost 
                 cost += sell_cost
                 self._n_trades += 1
@@ -248,11 +229,7 @@ class HFTradingEnv(gym.Env):
             invest_amount = self._cash * self.max_position
             self._shares_held = invest_amount / current_price
             short_cost = self.transaction_cost * invest_amount
-            
-            # Lock up 'invest_amount' of your own cash as 100% margin.
-            # Net cash change is $0, minus the transaction fee.
             self._cash -= short_cost 
-            
             cost += short_cost
             self._position = POSITION_SHORT
             self._entry_price = current_price
@@ -263,13 +240,11 @@ class HFTradingEnv(gym.Env):
         if self._position == POSITION_LONG:
             unrealized = (current_price - self._entry_price) * self._shares_held
             self._portfolio_value = self._cash + (self._shares_held * current_price)
-
         elif self._position == POSITION_SHORT:
             unrealized = (self._entry_price - current_price) * self._shares_held
             cost_to_buy_back = self._shares_held * current_price
             initial_short_proceeds = self._shares_held * self._entry_price
             self._portfolio_value = self._cash + initial_short_proceeds - cost_to_buy_back
-
         else:
             unrealized = 0.0
             self._portfolio_value = self._cash
@@ -277,12 +252,7 @@ class HFTradingEnv(gym.Env):
         self._max_portfolio_value = max(self._max_portfolio_value, self._portfolio_value)
         self._portfolio_history.append(self._portfolio_value)
 
-        # --- Log Returns Reward ---
-        # We calculate the step reward as the log return of the portfolio value.
-        # This provides a bounded, symmetric scale for PnL improvements.
-        # Log(current / previous) = Log(current) - Log(previous)
-        
-        # Ensure we don't log(0) if the portfolio blew up
+        # --- Reward Function (Pure Log Returns) ---
         safe_portfolio = max(self._portfolio_value, 1e-8)
         safe_prev_portfolio = max(prev_portfolio, 1e-8)
         
@@ -291,7 +261,7 @@ class HFTradingEnv(gym.Env):
         
         reward = (
             log_return 
-            # - self.transaction_cost * abs(position_change)  # transaction cost penalty
+            # - self.transaction_cost * abs(position_change) 
         )
 
         # --- Termination conditions ---
@@ -299,7 +269,6 @@ class HFTradingEnv(gym.Env):
             self._portfolio_value < 0.5 * self.initial_capital
             or self._step_idx >= len(self.df) - 1
         )
-        truncated = False
 
         info = {
             "portfolio_value": self._portfolio_value,
@@ -314,7 +283,7 @@ class HFTradingEnv(gym.Env):
 
         self._step_idx += 1
         obs = self._get_obs()
-        return obs, float(reward), terminated, truncated, info
+        return obs, float(reward), terminated, False, info
 
     def _get_obs(self) -> np.ndarray:
         """Return the last window_size bars as a flat float32 array."""
@@ -328,7 +297,6 @@ class HFTradingEnv(gym.Env):
             window = np.vstack([pad, window])
 
         obs = window.flatten()
-        # Clip to observation space bounds; replace NaN/Inf
         obs = np.nan_to_num(obs, nan=0.0, posinf=10.0, neginf=-10.0)
         return np.clip(obs, -10.0, 10.0)
 
@@ -365,19 +333,11 @@ class HFTradingEnv(gym.Env):
 # MultiMarketEnv
 # ---------------------------------------------------------------------------
 
-
 class MultiMarketEnv(gym.Env):
     """
     Multi-market wrapper that concatenates observations from N single-market
     HFTradingEnv instances and expects one action per market.
-
-    Observation space: concatenation of all sub-env observations (flat float32).
-    Action space:      MultiDiscrete([3] * n_markets) — one action per market.
-
-    Useful for training a single policy that simultaneously trades across
-    multiple tickers/markets.
     """
-
     metadata = {"render_modes": []}
 
     def __init__(
@@ -451,7 +411,6 @@ class MultiMarketEnv(gym.Env):
 # Vectorised environment factory
 # ---------------------------------------------------------------------------
 
-
 def make_envs(
     data_dict: dict[str, pd.DataFrame],
     n_envs: int = 4,
@@ -461,24 +420,6 @@ def make_envs(
     max_position: float = 0.95,
     multi_market: bool = False,
 ) -> VecEnv:
-    """
-    Create a SubprocVecEnv of HFTradingEnv (single-ticker) or MultiMarketEnv.
-
-    Parameters
-    ----------
-    data_dict:        Dict mapping ticker → feature DataFrame (from compute_features).
-    n_envs:           Number of parallel workers.
-    window_size:      Observation window in bars.
-    initial_capital:  Starting capital per sub-environment.
-    transaction_cost: Fractional transaction cost (e.g. 0.001 = 10 bps).
-    max_position:     Maximum fraction of capital in a single position.
-    multi_market:     If True, create a MultiMarketEnv over all tickers.
-                      If False, use the first ticker only (for single-ticker PPO).
-
-    Returns
-    -------
-    SubprocVecEnv ready for Stable-Baselines3 training.
-    """
     if multi_market:
         def _make_env():
             def _init():
@@ -495,7 +436,6 @@ def make_envs(
         env_fns = [_make_env() for _ in range(n_envs)]
         return SubprocVecEnv(env_fns)
 
-    # Single-ticker: pick first ticker from data_dict
     ticker, df = next(iter(data_dict.items()))
     logger.info("Creating %d parallel envs for ticker=%s", n_envs, ticker)
 
@@ -514,18 +454,12 @@ def make_envs(
     return SubprocVecEnv(env_fns)
 
 
-# ---------------------------------------------------------------------------
-# Standalone test / smoke test
-# ---------------------------------------------------------------------------
-
-
 if __name__ == "__main__":
     import pandas as pd
     import numpy as np
 
     logging.basicConfig(level=logging.DEBUG)
 
-    # Build a tiny synthetic OHLCV + feature dataset for smoke testing
     np.random.seed(42)
     n = 500
     close = 100 + np.cumsum(np.random.randn(n) * 0.5)
@@ -536,7 +470,6 @@ if __name__ == "__main__":
         "Close": close,
         "Volume": np.random.randint(1_000, 100_000, n).astype(float),
     })
-    # Add minimal z-score features
     for col in ["Open", "High", "Low", "Close", "Volume"]:
         df[f"z_{col}"] = (df[col] - df[col].rolling(100, min_periods=1).mean()) / (
             df[col].rolling(100, min_periods=1).std().replace(0, 1)

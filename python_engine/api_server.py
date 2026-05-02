@@ -24,6 +24,7 @@ from pydantic import BaseModel, Field
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger(__name__)
 
+
 # ── Paths ──────────────────────────────────────────────────────────────────────
 BASE = Path(__file__).parent
 MODELS_DIR = BASE / "models"
@@ -55,7 +56,7 @@ _paper_stop_event = threading.Event()
 
 class TrainRequest(BaseModel):
     market: str = "us"
-    timescale: str = "1m"
+    timescale: str = Field(default="1m", pattern="^(10s|1m|5m|1h|1d|1w)$")
     algo: str = "PPO"
     timesteps: int = Field(default=1_000_000, ge=10_000, le=10_000_000)
 
@@ -63,7 +64,7 @@ class TrainRequest(BaseModel):
 class BacktestRequest(BaseModel):
     model_path: str
     market: str = "us"
-    timescale: str = "1m"
+    timescale: str = Field(default="1m", pattern="^(10s|1m|5m|1h|1d|1w)$")
     start_date: str = "2023-01-01"
     end_date: str = "2023-12-31"
 
@@ -71,7 +72,7 @@ class BacktestRequest(BaseModel):
 class RedTeamRequest(BaseModel):
     model_path: str
     market: str = "us"
-    timescale: str = "1m"
+    timescale: str = Field(default="1m", pattern="^(10s|1m|5m|1h|1d|1w)$")
     scenarios: list[str] = Field(
         default_factory=lambda: [
             "flash_crash",
@@ -112,20 +113,24 @@ def _train_worker(job_id: str, req: TrainRequest) -> None:
     try:
         import stable_baselines3  # noqa: F401
         from data_pipeline import load_dataset
-        from rl_environment import make_envs
         from trainer import train_model
 
         data_dict = load_dataset(req.market, req.timescale)
         if data_dict:
             real_training = True
+            
+            # For simplicity, if training via UI we just target the first ticker
+            # In a full UI you'd allow passing a list of tickers
+            from data_pipeline import US_TICKERS, HK_TICKERS
+            target_tickers = US_TICKERS if req.market == "us" else HK_TICKERS
+
             model_path = train_model(
                 market=req.market,
                 timescale=req.timescale,
+                target_tickers=target_tickers,
                 algorithm=req.algo,
                 total_timesteps=req.timesteps,
                 n_envs=4,
-                job_id=job_id,
-                progress_cb=lambda s, r: _update_job(job_id, s, r, total),
             )
             with _job_lock:
                 _jobs[job_id]["status"] = "done"
@@ -238,12 +243,18 @@ async def run_backtest(req: BacktestRequest) -> dict:
     real_metrics = False
     try:
         from backtester import run_backtest as _bt, generate_backtest_report
+        from trainer import _build_multi_timeframe_df
         from data_pipeline import load_dataset
+        
+        # We need to load the data to find the available tickers first
         data = load_dataset(req.market, req.timescale)
+        
         if data and req.model_path and Path(req.model_path).exists():
-            ticker_data = list(data.values())[0]
-            from data_pipeline import compute_features
-            ticker_data = compute_features(ticker_data)
+            ticker = list(data.keys())[0]
+            
+            # Using the new multi-timeframe builder instead of just compute_features
+            ticker_data = _build_multi_timeframe_df(req.market, req.timescale, ticker)
+            
             result = _bt(req.model_path, ticker_data, req.market)
             real_metrics = True
             return result
@@ -356,7 +367,6 @@ async def run_red_team(req: RedTeamRequest) -> dict:
         # Mock
         metrics = meta["mock"](rng)
         passed = meta["pass_threshold"](metrics)
-        # Build human-readable metric summary
         if scenario_id == "flash_crash":
             metric_str = f"Return during crash: {metrics['crash_return']*100:.1f}%"
         elif scenario_id == "liquidity_drought":
@@ -410,7 +420,6 @@ async def list_models() -> dict:
                         pass
                 model_file = model_dir / "final_model.zip"
                 if not model_file.exists():
-                    # Also check for any .zip or .onnx
                     zips = list(model_dir.glob("*.zip")) + list(model_dir.glob("*.onnx"))
                     model_file = zips[0] if zips else model_dir / "final_model.zip"
                 models.append({
@@ -423,12 +432,11 @@ async def list_models() -> dict:
                     "created_at": meta.get("created_at", "—"),
                 })
 
-    # Always include demo models for UI
     if not models:
         models = [
             {"name": "PPO_US_1m_v3", "path": "models/ppo_us_1m_demo.zip", "market": "us", "timescale": "1m", "algo": "PPO", "final_reward": 1.82, "created_at": "2024-11-30 14:00"},
             {"name": "TD3_HK_5m_v2", "path": "models/td3_hk_5m_demo.zip", "market": "hk", "timescale": "5m", "algo": "TD3", "final_reward": 1.54, "created_at": "2024-11-29 10:00"},
-            {"name": "PPO_US_10s_v1", "path": "models/ppo_us_10s_demo.zip", "market": "us", "timescale": "10s", "algo": "PPO", "final_reward": 1.31, "created_at": "2024-11-28 08:00"},
+            {"name": "PPO_US_1d_v1", "path": "models/ppo_us_1d_demo.zip", "market": "us", "timescale": "1d", "algo": "PPO", "final_reward": 1.31, "created_at": "2024-11-28 08:00"},
         ]
 
     return {"models": [m["name"] for m in models], "details": models}

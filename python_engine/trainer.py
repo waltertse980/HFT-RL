@@ -37,8 +37,8 @@ from stable_baselines3.common.callbacks import (
 from stable_baselines3.common.monitor import Monitor
 from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv, VecNormalize
 
-from data_pipeline import load_dataset, US_TICKERS, HK_TICKERS
-from rl_environment import HFTradingEnv, make_envs
+from data_pipeline import load_dataset, SUPPORTED_TIMESCALES, US_TICKERS, HK_TICKERS
+from rl_environment import HFTradingEnv, make_envs, _get_feature_cols
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(
@@ -56,6 +56,15 @@ LOGS_DIR.mkdir(parents=True, exist_ok=True)
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 logger.info("Training device: %s", DEVICE)
 
+# Durations used to strictly prevent look-ahead bias
+DURATION_SEC = {
+    "10s": 10,
+    "1m": 60,
+    "5m": 300,
+    "1h": 3600,
+    "1d": 86400,
+    "1w": 604800
+}
 
 # ---------------------------------------------------------------------------
 # Typed return dicts
@@ -98,7 +107,6 @@ class EarlyStoppingCallback(BaseCallback):
         if self.n_calls % self.check_freq != 0:
             return True
 
-        # ep_rew_mean is logged by SB3 Monitor wrapper
         if len(self.model.ep_info_buffer) == 0:
             return True
 
@@ -118,7 +126,7 @@ class EarlyStoppingCallback(BaseCallback):
                     self.patience * self.check_freq,
                     self._best_mean_reward,
                 )
-            return False  # stops training
+            return False 
 
         return True
 
@@ -138,6 +146,56 @@ def _train_test_split(
         train[ticker] = df.iloc[:split].copy()
         test[ticker] = df.iloc[split:].copy()
     return train, test
+
+
+# ---------------------------------------------------------------------------
+# Multi-Timeframe Fusion Engine
+# ---------------------------------------------------------------------------
+
+def _build_multi_timeframe_df(market: str, base_timescale: str, ticker: str) -> pd.DataFrame:
+    """
+    Constructs a master dataset that incorporates technical features from all 
+    available timescales, strictly aligned to avoid look-ahead bias.
+    """
+    base_data = load_dataset(market, base_timescale)
+    if ticker not in base_data:
+        raise ValueError(f"Ticker {ticker} not found in {base_timescale} data.")
+        
+    base_df = base_data[ticker].copy()
+    
+    for ts in SUPPORTED_TIMESCALES:
+        if ts == base_timescale:
+            continue
+            
+        try:
+            ts_data = load_dataset(market, ts)
+            if ticker in ts_data:
+                ts_df = ts_data[ticker].copy()
+                
+                # We only merge normalized feature columns from the secondary timeframes, 
+                # leaving the raw pricing for the base timeframe untouched.
+                f_cols = _get_feature_cols(ts_df)
+                if not f_cols:
+                    continue
+                ts_df = ts_df[f_cols].add_suffix(f"_{ts}")
+                
+                # PREVENT LOOK-AHEAD BIAS: 
+                # Shift the timestamp index of the secondary timeframe to the exact 
+                # moment its bar closes. For instance, a 1h bar starting at 10:00 
+                # completes at 11:00. This ensures we only ffill completed bar data.
+                ts_dur = DURATION_SEC[ts]
+                ts_df.index = ts_df.index + pd.Timedelta(seconds=ts_dur)
+                
+                # Forward-fill to the base dataframe's start timestamps
+                ts_df_aligned = ts_df.reindex(base_df.index, method='ffill')
+                base_df = base_df.join(ts_df_aligned)
+                
+        except FileNotFoundError:
+            logger.debug(f"Timescale {ts} not found for {ticker}; skipping merge.")
+            
+    # Drop initial rows that lack sufficient multi-timeframe history
+    base_df.dropna(inplace=True)
+    return base_df
 
 
 # ---------------------------------------------------------------------------
@@ -201,7 +259,6 @@ def train_model(
     initial_capital: float = 100_000.0,
     transaction_cost: float = 0.0,
 ) -> str:
-    # Use the first ticker for the run name, or "multi" if more than one
     ticker_tag = target_tickers[0] if len(target_tickers) == 1 else "multi"
     run_name = f"{ticker_tag}_{market}_{timescale}_{algorithm}"
     
@@ -209,20 +266,22 @@ def train_model(
     ckpt_dir = MODELS_DIR / run_name
     ckpt_dir.mkdir(parents=True, exist_ok=True)
 
-    logger.info("Loading dataset: market=%s timescale=%s", market, timescale)
-    data_dict = load_dataset(market, timescale)
+    logger.info("Building multi-timeframe datasets for target tickers...")
+    multi_tf_data_dict = {}
     
-    # Filter the loaded data dict to only include the user-specified tickers
-    filtered_data_dict = {k: v for k, v in data_dict.items() if k in target_tickers}
-    if not filtered_data_dict:
-        raise ValueError(f"None of the target tickers {target_tickers} were found in the dataset.")
-        
-    train_data, test_data = _train_test_split(filtered_data_dict, test_ratio=0.2)
+    for ticker in target_tickers:
+        try:
+            df_merged = _build_multi_timeframe_df(market, timescale, ticker)
+            multi_tf_data_dict[ticker] = df_merged
+        except Exception as exc:
+            logger.error("Failed to build multi-TF data for %s: %s", ticker, exc)
+            
+    if not multi_tf_data_dict:
+        raise ValueError(f"None of the target tickers {target_tickers} could be prepared.")
 
+    train_data, test_data = _train_test_split(multi_tf_data_dict, test_ratio=0.2)
     logger.info("Creating training environments (n_envs=%d)...", n_envs)
 
-    # Note: Currently uses the first ticker in the dict. For multi-ticker training, 
-    # you would need an environment that accepts multiple DFs.
     ticker = next(iter(train_data.keys()))
     df_train = train_data[ticker]
 
@@ -239,7 +298,6 @@ def train_model(
         env_fns = [_env_fn for _ in range(n_envs)]
         vec_env = SubprocVecEnv(env_fns)
         
-        # Apply normalization to stabilize rewards and observations for PPO
         vec_env = VecNormalize(vec_env, norm_obs=True, norm_reward=True, clip_reward=10.0)
         model = _build_ppo(vec_env, tb_log_dir)
 
@@ -250,7 +308,6 @@ def train_model(
         )
 
         class _ContinuousHFTEnv(HFTradingEnv):
-            """Thin wrapper converting Discrete(3) to Box([0,3)) for TD3."""
             import gymnasium as _gym
 
             def __init__(self, **kwargs):
@@ -272,15 +329,12 @@ def train_model(
             return Monitor(env)
 
         vec_env = DummyVecEnv([_td3_env_fn])
-        
-        # Apply normalization to TD3 as well
         vec_env = VecNormalize(vec_env, norm_obs=True, norm_reward=True, clip_reward=10.0)
         model = _build_td3(vec_env, tb_log_dir)
 
     else:
         raise ValueError(f"Unsupported algorithm '{algorithm}'. Choose 'PPO' or 'TD3'.")
 
-    # --- Callbacks ---
     checkpoint_cb = CheckpointCallback(
         save_freq=max(100_000 // n_envs, 1),
         save_path=str(ckpt_dir),
@@ -308,7 +362,6 @@ def train_model(
     final_path = str(ckpt_dir / "model_final")
     model.save(final_path)
     
-    # Save the VecNormalize statistics
     vec_norm_path = str(ckpt_dir / "vec_normalize.pkl")
     vec_env.save(vec_norm_path)
     
@@ -329,11 +382,6 @@ def export_to_onnx(
     obs_dim: int,
     algorithm: str = "PPO",
 ) -> str:
-    """
-    Export a Stable-Baselines3 model's policy network to ONNX FP16 (opset 17).
-    Note: The exported ONNX model expects *normalized* observations if trained 
-    with VecNormalize. In production, you must scale inputs identically.
-    """
     logger.info("Loading model from %s", model_path)
     ModelClass = PPO if algorithm == "PPO" else TD3
     model = ModelClass.load(model_path, device="cpu")
@@ -423,10 +471,8 @@ def evaluate_model(
         eval_env = DummyVecEnv([_eval_env_fn])
         eval_env.seed(ep * 42)
 
-        # Load normalization statistics to ensure inputs match training conditions
         if vec_norm_path.exists():
             eval_env = VecNormalize.load(str(vec_norm_path), eval_env)
-            # Disable updates and reward scaling for pure evaluation
             eval_env.training = False
             eval_env.norm_reward = False
 
@@ -456,7 +502,6 @@ def evaluate_model(
         
         eval_env.close()
 
-    # Aggregate metrics
     avg_return = float(np.mean(all_returns))
     avg_n_trades = int(np.mean(all_n_trades))
     avg_pnl = float(np.mean(all_pnls))
@@ -495,7 +540,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="HFT RL Trainer")
     parser.add_argument("--market", choices=["us", "hk", "both"], default="us")
     parser.add_argument(
-        "--timescale", choices=["10s", "1m", "5m", "1h", "all"], default="1m"
+        "--timescale", choices=["10s", "1m", "5m", "1h", "1d", "1w", "all"], default="1m"
     )
     parser.add_argument("--algo", choices=["PPO", "TD3", "both"], default="PPO")
     parser.add_argument("--timesteps", type=int, default=1_000_000)
@@ -504,8 +549,6 @@ def main() -> None:
         "--export-onnx", action="store_true", help="Export to ONNX after training"
     )
     parser.add_argument("--window-size", type=int, default=60)
-    
-    # Optional ticker list, e.g. --ticker AAPL NVDA
     parser.add_argument(
         "--ticker", 
         nargs="+", 
@@ -515,11 +558,10 @@ def main() -> None:
     args = parser.parse_args()
 
     markets = ["us", "hk"] if args.market == "both" else [args.market]
-    timescales = ["10s", "1m", "5m", "1h"] if args.timescale == "all" else [args.timescale]
+    timescales = ["10s", "1m", "5m", "1h", "1d", "1w"] if args.timescale == "all" else [args.timescale]
     algos = ["PPO", "TD3"] if args.algo == "both" else [args.algo]
 
     for market in markets:
-        # Determine the target tickers for this market loop
         if args.ticker is not None:
             target_tickers = args.ticker
         else:
@@ -543,12 +585,8 @@ def main() -> None:
                     logger.info("Saved model: %s", model_path)
 
                     if args.export_onnx:
-                        data_dict = load_dataset(market, timescale)
-                        # Extract the first valid target ticker for ONNX dims
-                        filtered_dict = {k: v for k, v in data_dict.items() if k in target_tickers}
-                        ticker = next(iter(filtered_dict.keys()))
-                        df = filtered_dict[ticker]
-                        from rl_environment import _get_feature_cols
+                        # Build the multi-tf dataset to calculate the proper observation dimension
+                        df = _build_multi_timeframe_df(market, timescale, target_tickers[0])
                         n_features = len(_get_feature_cols(df))
                         obs_dim = args.window_size * n_features
 
@@ -561,10 +599,7 @@ def main() -> None:
                         )
 
                     # Quick evaluation
-                    data_dict = load_dataset(market, timescale)
-                    filtered_dict = {k: v for k, v in data_dict.items() if k in target_tickers}
-                    ticker = next(iter(filtered_dict.keys()))
-                    df = filtered_dict[ticker]
+                    df = _build_multi_timeframe_df(market, timescale, target_tickers[0])
                     n = len(df)
                     test_df = df.iloc[int(n * 0.8):]
                     metrics = evaluate_model(
