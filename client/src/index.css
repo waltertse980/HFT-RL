@@ -1,0 +1,134 @@
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap');
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  --background: 222 47% 7%;         /* #0a0e1a */
+  --foreground: 213 31% 91%;        /* #e2e8f0 */
+  --card: 222 44% 12%;              /* #0f1628 */
+  --card-foreground: 213 31% 91%;
+  --popover: 222 44% 12%;
+  --popover-foreground: 213 31% 91%;
+  --primary: 217 91% 60%;           /* #3b82f6 electric blue */
+  --primary-foreground: 222 47% 7%;
+  --secondary: 222 40% 20%;
+  --secondary-foreground: 213 31% 91%;
+  --muted: 222 40% 18%;
+  --muted-foreground: 215 16% 47%;
+  --accent: 222 40% 20%;
+  --accent-foreground: 213 31% 91%;
+  --destructive: 0 84% 60%;         /* red for SELL */
+  --destructive-foreground: 213 31% 91%;
+  --border: 222 35% 20%;
+  --input: 222 35% 20%;
+  --ring: 217 91% 60%;
+  --radius: 0.5rem;
+  --success: 142 71% 45%;           /* green for BUY */
+  --warning: 48 96% 53%;            /* yellow for HOLD */
+
+  /* Sidebar vars */
+  --sidebar: 222 47% 8%;
+  --sidebar-foreground: 213 31% 91%;
+  --sidebar-border: 222 35% 20%;
+  --sidebar-primary: 217 91% 60%;
+  --sidebar-primary-foreground: 222 47% 7%;
+  --sidebar-accent: 222 40% 16%;
+  --sidebar-accent-foreground: 213 31% 91%;
+  --sidebar-ring: 217 91% 60%;
+
+  /* card-border used in some components */
+  --card-border: 222 35% 18%;
+  --popover-border: 222 35% 20%;
+
+  --font-sans: 'Inter', sans-serif;
+  --font-mono: 'JetBrains Mono', monospace;
+}
+
+@layer base {
+  * {
+    @apply border-border;
+  }
+
+  body {
+    @apply bg-background text-foreground antialiased;
+    font-family: var(--font-sans);
+  }
+
+  ::-webkit-scrollbar {
+    width: 6px;
+    height: 6px;
+  }
+  ::-webkit-scrollbar-track {
+    background: hsl(var(--background));
+  }
+  ::-webkit-scrollbar-thumb {
+    background: hsl(var(--border));
+    border-radius: 3px;
+  }
+  ::-webkit-scrollbar-thumb:hover {
+    background: hsl(var(--muted-foreground));
+  }
+}
+
+@layer utilities {
+  .font-mono {
+    font-family: var(--font-mono) !important;
+  }
+
+  .text-success {
+    color: hsl(var(--success));
+  }
+
+  .text-warning {
+    color: hsl(var(--warning));
+  }
+
+  .bg-success {
+    background-color: hsl(var(--success));
+  }
+
+  .bg-warning {
+    background-color: hsl(var(--warning));
+  }
+
+  .border-success {
+    border-color: hsl(var(--success));
+  }
+
+  .border-warning {
+    border-color: hsl(var(--warning));
+  }
+
+  .bg-success\/10 {
+    background-color: hsl(var(--success) / 0.1);
+  }
+
+  .bg-warning\/10 {
+    background-color: hsl(var(--warning) / 0.1);
+  }
+
+  .bg-destructive\/10 {
+    background-color: hsl(var(--destructive) / 0.1);
+  }
+
+  /* HFT terminal glow effect */
+  .glow-blue {
+    box-shadow: 0 0 12px hsl(var(--primary) / 0.3);
+  }
+
+  .glow-green {
+    box-shadow: 0 0 8px hsl(var(--success) / 0.4);
+  }
+
+  .glow-red {
+    box-shadow: 0 0 8px hsl(var(--destructive) / 0.4);
+  }
+
+  /* Dense table rows */
+  .table-dense td,
+  .table-dense th {
+    @apply py-1 px-2 text-xs;
+  }
+}
