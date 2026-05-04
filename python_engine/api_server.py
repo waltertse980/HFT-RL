@@ -957,6 +957,311 @@ async def health() -> dict:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Settings endpoints
+# ─────────────────────────────────────────────────────────────────────────────
+
+GLOBAL_CONFIG_FILE = BASE / "global_config.json"
+
+
+def _load_global_config() -> dict:
+    if GLOBAL_CONFIG_FILE.exists():
+        try:
+            return json.loads(GLOBAL_CONFIG_FILE.read_text())
+        except Exception:
+            pass
+    return {"initial_capital": 100000.0}
+
+
+def _save_global_config(config: dict) -> None:
+    GLOBAL_CONFIG_FILE.write_text(json.dumps(config, indent=2))
+
+
+class TestConnectionRequest(BaseModel):
+    api_key: str
+    api_secret: str
+    base_url: str = "https://paper-api.alpaca.markets"
+
+
+@app.post("/settings/test-connection")
+async def test_alpaca_connection(req: TestConnectionRequest):
+    """Test Alpaca API credentials by fetching account info."""
+    import httpx
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.get(
+                f"{req.base_url}/v2/account",
+                headers={
+                    "APCA-API-KEY-ID": req.api_key,
+                    "APCA-API-SECRET-KEY": req.api_secret,
+                }
+            )
+        if resp.status_code == 401:
+            raise HTTPException(status_code=401, detail="Invalid API credentials")
+        if resp.status_code == 403:
+            raise HTTPException(status_code=403, detail="API key does not have required permissions")
+        if not resp.is_success:
+            raise HTTPException(status_code=resp.status_code, detail=f"Alpaca API error: {resp.text}")
+        account = resp.json()
+        return {
+            "connected": True,
+            "account_status": account.get("status", "ACTIVE"),
+            "buying_power": float(account.get("buying_power", 0)),
+            "portfolio_value": float(account.get("portfolio_value", 0)),
+            "currency": account.get("currency", "USD"),
+        }
+    except httpx.TimeoutException:
+        raise HTTPException(status_code=504, detail="Connection to Alpaca timed out")
+    except httpx.ConnectError:
+        raise HTTPException(status_code=503, detail="Cannot reach Alpaca API")
+
+
+@app.get("/settings/global")
+async def get_global_settings():
+    return _load_global_config()
+
+
+class GlobalSettingsRequest(BaseModel):
+    initial_capital: float = 100000.0
+
+
+@app.post("/settings/global")
+async def save_global_settings(req: GlobalSettingsRequest):
+    config = _load_global_config()
+    config["initial_capital"] = req.initial_capital
+    _save_global_config(config)
+    return config
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Additional training endpoints
+# ─────────────────────────────────────────────────────────────────────────────
+
+@app.post("/train/{job_id}/stop")
+async def stop_training_job(job_id: str):
+    job = _jobs.get(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail=f"Job {job_id} not found")
+    job["status"] = "stopped"
+    job["error_msg"] = "Stopped by user"
+    return {"ok": True, "job_id": job_id, "status": "stopped"}
+
+
+class EvaluateRequest(BaseModel):
+    market: str = "us"
+    timescale: str = "1m"
+    n_episodes: int = 5
+
+
+@app.post("/train/evaluate/{model_name}")
+async def evaluate_model_endpoint(model_name: str, req: EvaluateRequest, background_tasks: BackgroundTasks):
+    model_path = MODELS_DIR / model_name
+    if not model_path.exists():
+        raise HTTPException(status_code=404, detail=f"Model not found: {model_name}")
+
+    # Run in background, return job_id
+    eval_job_id = str(uuid.uuid4())
+    _jobs[eval_job_id] = {"status": "running", "type": "eval", "model": model_name, "progress_pct": 0}
+
+    async def _run_eval():
+        try:
+            from trainer import evaluate_model, split_data
+            from data_pipeline import load_dataset
+            data_dict = load_dataset(req.market, req.timescale)
+            ticker = next(iter(data_dict))
+            _, _, test_df = split_data(data_dict[ticker])
+            vecnorm_path = str(model_path.parent / "vecnorm.pkl") if (model_path.parent / "vecnorm.pkl").exists() else None
+            # Detect algorithm from filename
+            algo = "TD3" if "td3" in model_name.lower() else "PPO"
+            metrics = evaluate_model(str(model_path), test_df, algo, market=req.market, vecnorm_path=vecnorm_path)
+            _jobs[eval_job_id].update({"status": "done", "progress_pct": 100, "metrics": metrics})
+        except Exception as exc:
+            _jobs[eval_job_id].update({"status": "error", "error_msg": str(exc)})
+
+    background_tasks.add_task(_run_eval)
+    return {"eval_job_id": eval_job_id, "status": "started"}
+
+
+class ExportOnnxRequest(BaseModel):
+    model_path: str
+    algorithm: str = "PPO"
+    obs_dim: Optional[int] = None
+
+
+@app.post("/train/export-onnx")
+async def export_onnx_endpoint(req: ExportOnnxRequest, background_tasks: BackgroundTasks):
+    mp = Path(req.model_path)
+    if not mp.exists():
+        mp = MODELS_DIR / req.model_path
+    if not mp.exists():
+        raise HTTPException(status_code=404, detail=f"Model not found: {req.model_path}")
+
+    onnx_path = str(mp.with_suffix(".onnx"))
+    export_job_id = str(uuid.uuid4())
+    _jobs[export_job_id] = {"status": "running", "type": "onnx_export", "progress_pct": 0}
+
+    async def _run_export():
+        try:
+            from trainer import export_to_onnx
+            obs_dim = req.obs_dim or 61  # default: 60 features * 1 window + 1 position
+            result = export_to_onnx(str(mp), onnx_path, obs_dim, req.algorithm)
+            _jobs[export_job_id].update({"status": "done", "progress_pct": 100, "onnx_path": result})
+        except Exception as exc:
+            _jobs[export_job_id].update({"status": "error", "error_msg": str(exc)})
+
+    background_tasks.add_task(_run_export)
+    return {"export_job_id": export_job_id, "onnx_path": onnx_path, "status": "started"}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Additional models endpoints
+# ─────────────────────────────────────────────────────────────────────────────
+
+@app.delete("/models/{model_name}")
+async def delete_model(model_name: str):
+    model_path = MODELS_DIR / model_name
+    if not model_path.exists():
+        raise HTTPException(status_code=404, detail=f"Model not found: {model_name}")
+    model_path.unlink()
+    # Also delete vecnorm if exists
+    vecnorm = model_path.parent / "vecnorm.pkl"
+    if vecnorm.exists():
+        vecnorm.unlink()
+    return {"ok": True, "deleted": model_name}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Data download / management endpoints
+# ─────────────────────────────────────────────────────────────────────────────
+
+_data_jobs: dict = {}  # job_id -> {status, ticker, timescale, progress_pct, elapsed_secs, error_msg}
+
+
+class DataDownloadRequest(BaseModel):
+    market: str = "us"
+    tickers: list[str] = ["AAPL"]
+    timescale: str = "1m"
+    start_date: Optional[str] = None
+    end_date: Optional[str] = None
+    train_ratio: float = 0.6
+    val_ratio: float = 0.3
+
+
+@app.post("/data/download")
+async def download_data(req: DataDownloadRequest, background_tasks: BackgroundTasks):
+    job_id = str(uuid.uuid4())
+    _data_jobs[job_id] = {
+        "job_id": job_id, "ticker": ",".join(req.tickers), "timescale": req.timescale,
+        "status": "downloading", "progress_pct": 0, "elapsed_secs": 0, "error_msg": None
+    }
+
+    async def _download():
+        import time as _time
+        start = _time.time()
+        try:
+            from data_pipeline import load_dataset
+            _data_jobs[job_id]["status"] = "downloading"
+            _data_jobs[job_id]["progress_pct"] = 10
+            data = load_dataset(req.market, req.timescale, tickers=req.tickers,
+                                start=req.start_date, end=req.end_date)
+            _data_jobs[job_id]["status"] = "processing"
+            _data_jobs[job_id]["progress_pct"] = 70
+            # Save split datasets
+            for ticker, df in data.items():
+                n = len(df)
+                n_train = int(n * req.train_ratio)  # noqa: F841
+                n_val = int(n * req.val_ratio)  # noqa: F841
+                out_path = DATA_DIR / f"{ticker}_{req.market}_{req.timescale}.parquet"
+                df.to_parquet(str(out_path))
+            _data_jobs[job_id]["status"] = "done"
+            _data_jobs[job_id]["progress_pct"] = 100
+            _data_jobs[job_id]["elapsed_secs"] = int(_time.time() - start)
+        except Exception as exc:
+            _data_jobs[job_id]["status"] = "error"
+            _data_jobs[job_id]["error_msg"] = str(exc)
+
+    background_tasks.add_task(_download)
+    return {"job_id": job_id, "status": "started"}
+
+
+@app.get("/data/jobs")
+async def get_data_jobs():
+    return {"jobs": list(_data_jobs.values())}
+
+
+@app.get("/data/available")
+async def get_available_datasets():
+    datasets = []
+    for f in DATA_DIR.glob("*.parquet"):
+        try:
+            import pandas as pd
+            df = pd.read_parquet(str(f))
+            parts = f.stem.split("_")
+            # filename: TICKER_market_timescale.parquet
+            n = len(df)
+            datasets.append({
+                "ticker": parts[0] if parts else f.stem,
+                "market": parts[1] if len(parts) > 1 else "us",
+                "timescale": parts[2] if len(parts) > 2 else "1m",
+                "n_bars": n,
+                "n_train": int(n * 0.6),
+                "n_val": int(n * 0.3),
+                "n_test": int(n * 0.1),
+                "size_mb": round(f.stat().st_size / 1e6, 2),
+                "created_at": pd.Timestamp(f.stat().st_mtime, unit='s').isoformat(),
+                "file_path": str(f),
+            })
+        except Exception:
+            continue
+    return {"datasets": datasets}
+
+
+class DeleteDatasetRequest(BaseModel):
+    ticker: str
+    market: str
+    timescale: str
+
+
+@app.delete("/data/dataset")
+async def delete_dataset(req: DeleteDatasetRequest):
+    fname = f"{req.ticker}_{req.market}_{req.timescale}.parquet"
+    fpath = DATA_DIR / fname
+    if not fpath.exists():
+        raise HTTPException(status_code=404, detail=f"Dataset not found: {fname}")
+    fpath.unlink()
+    return {"ok": True, "deleted": fname}
+
+
+@app.get("/data/preview")
+async def preview_dataset(ticker: str = "AAPL", market: str = "us", timescale: str = "1m"):
+    import pandas as pd
+    fpath = DATA_DIR / f"{ticker}_{market}_{timescale}.parquet"
+    if not fpath.exists():
+        raise HTTPException(status_code=404, detail="Dataset not found. Download it first.")
+    df = pd.read_parquet(str(fpath))
+    last200 = df.tail(200)
+    bars = []
+    for idx, row in last200.iterrows():
+        bars.append({
+            "t": str(idx) if hasattr(idx, 'isoformat') else str(idx),
+            "c": float(row.get("close", row.get("Close", 0))),
+            "v": float(row.get("volume", row.get("Volume", 0))),
+        })
+    returns = df["close"].pct_change().dropna() if "close" in df.columns else pd.Series([0])
+    ann_vol = float(returns.std() * (252 * 390) ** 0.5)
+    return {
+        "bars": bars,
+        "stats": {
+            "total_bars": len(df),
+            "date_from": str(df.index[0]) if len(df) > 0 else "",
+            "date_to": str(df.index[-1]) if len(df) > 0 else "",
+            "missing_pct": round(df.isnull().mean().mean() * 100, 2),
+            "avg_volume": float(df.get("volume", pd.Series([0])).mean()),
+            "ann_volatility": round(ann_vol, 4),
+        }
+    }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Entry point
 # ─────────────────────────────────────────────────────────────────────────────
 

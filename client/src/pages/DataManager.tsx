@@ -1,6 +1,4 @@
 import { useState, useEffect, useCallback } from "react";
-import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
-import { apiRequest } from "@/lib/queryClient";
 import {
   LineChart,
   Line,
@@ -43,6 +41,38 @@ import {
   BarChart2,
   FileText,
 } from "lucide-react";
+
+// ─── API fetch helper ─────────────────────────────────────────────────────────
+
+async function apiFetch<T>(url: string, options?: RequestInit): Promise<{ data: T | null; engineOffline: boolean; error: string | null }> {
+  try {
+    const res = await fetch(url, options);
+    if (res.status === 503) return { data: null, engineOffline: true, error: 'ENGINE_OFFLINE' };
+    if (!res.ok) {
+      const body = await res.json().catch(() => ({})) as { message?: string };
+      return { data: null, engineOffline: false, error: body.message ?? `HTTP ${res.status}` };
+    }
+    return { data: await res.json() as T, engineOffline: false, error: null };
+  } catch (err) {
+    return { data: null, engineOffline: false, error: String(err) };
+  }
+}
+
+// ─── EngineOfflineBanner ──────────────────────────────────────────────────────
+
+function EngineOfflineBanner() {
+  return (
+    <div className="mx-4 mt-4 p-3 rounded-lg border border-destructive/40 bg-destructive/10 flex items-start gap-3">
+      <AlertCircle size={16} className="text-destructive mt-0.5 shrink-0" />
+      <div>
+        <p className="text-sm font-semibold text-destructive">Python engine is offline</p>
+        <p className="text-xs text-muted-foreground mt-0.5 font-mono">
+          cd python_engine && uvicorn api_server:app --port 8001 --reload
+        </p>
+      </div>
+    </div>
+  );
+}
 
 // ─── Types ───────────────────────────────────────────────────────────────────
 
@@ -101,64 +131,6 @@ interface DownloadResponse {
   job_id: string;
 }
 
-// ─── Mock data ───────────────────────────────────────────────────────────────
-
-const MOCK_DATASETS: DatasetInfo[] = [
-  {
-    ticker: "AAPL",
-    market: "us",
-    timescale: "1m",
-    n_bars: 48200,
-    n_train: 28920,
-    n_val: 14460,
-    n_test: 4820,
-    size_mb: 12.4,
-    created_at: "2024-01-15",
-    file_path: "data/aapl_us_1m.parquet",
-  },
-  {
-    ticker: "NVDA",
-    market: "us",
-    timescale: "1m",
-    n_bars: 51000,
-    n_train: 30600,
-    n_val: 15300,
-    n_test: 5100,
-    size_mb: 13.1,
-    created_at: "2024-01-15",
-    file_path: "data/nvda_us_1m.parquet",
-  },
-  {
-    ticker: "0700.HK",
-    market: "hk",
-    timescale: "1m",
-    n_bars: 39600,
-    n_train: 23760,
-    n_val: 11880,
-    n_test: 3960,
-    size_mb: 9.8,
-    created_at: "2024-01-14",
-    file_path: "data/0700.HK_hk_1m.parquet",
-  },
-];
-
-// Generate mock preview bars for a given ticker
-function generateMockBars(ticker: string): PreviewBar[] {
-  const bars: PreviewBar[] = [];
-  const seed = ticker.charCodeAt(0);
-  let price = 150 + seed;
-  const now = Date.now();
-  for (let i = 199; i >= 0; i--) {
-    price = price + (Math.random() - 0.49) * 2;
-    bars.push({
-      t: new Date(now - i * 60_000).toISOString(),
-      c: Math.max(1, parseFloat(price.toFixed(2))),
-      v: Math.floor(50000 + Math.random() * 200000),
-    });
-  }
-  return bars;
-}
-
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
 function today(): string {
@@ -206,8 +178,6 @@ function statusLabel(status: DataJob["status"]): string {
 // ─── Component ───────────────────────────────────────────────────────────────
 
 export default function DataManager() {
-  const qc = useQueryClient();
-
   // ── Config state
   const [market, setMarket] = useState<"us" | "hk">("us");
   const [tickerInput, setTickerInput] = useState("AAPL, NVDA, META");
@@ -224,59 +194,85 @@ export default function DataManager() {
   // ── Jobs that should be hidden (completed > 5s ago)
   const [hiddenJobs, setHiddenJobs] = useState<Set<string>>(new Set());
 
-  // ─── Queries ─────────────────────────────────────────────────────────────
+  // ── Fetched state (replacing useQuery — we need 503 detection)
+  const [datasets, setDatasets] = useState<DatasetInfo[]>([]);
+  const [datasetsLoading, setDatasetsLoading] = useState(true);
+  const [isEngineOffline, setIsEngineOffline] = useState(false);
 
-  const availableQuery = useQuery<AvailableResponse>({
-    queryKey: ["/api/data/available"],
-    refetchInterval: 10_000,
-    retry: false,
-  });
+  const [jobs, setJobs] = useState<DataJob[]>([]);
 
-  const datasets: DatasetInfo[] =
-    availableQuery.data?.datasets ?? MOCK_DATASETS;
+  const [previewData, setPreviewData] = useState<PreviewResponse | null>(null);
+  const [previewLoading, setPreviewLoading] = useState(false);
+  const [previewEngineOffline, setPreviewEngineOffline] = useState(false);
 
-  const jobsQuery = useQuery<JobsResponse>({
-    queryKey: ["/api/data/jobs"],
-    refetchInterval: 2_000,
-    retry: false,
-  });
+  // ── Download mutation state
+  const [downloadPending, setDownloadPending] = useState(false);
+  const [downloadError, setDownloadError] = useState<string | null>(null);
+  const [downloadSuccessJobId, setDownloadSuccessJobId] = useState<string | null>(null);
 
-  const previewQuery = useQuery<PreviewResponse>({
-    queryKey: selectedDataset
-      ? [
-          `/api/data/preview?ticker=${selectedDataset.ticker}&market=${selectedDataset.market}&timescale=${selectedDataset.timescale}`,
-        ]
-      : ["__disabled__"],
-    enabled: !!selectedDataset,
-    retry: false,
-  });
+  // ── Toast state
+  const [toast, setToast] = useState<{ message: string; variant: "error" | "success" } | null>(null);
 
-  // ─── Mutations ───────────────────────────────────────────────────────────
+  const showToast = useCallback((message: string, variant: "error" | "success" = "error") => {
+    setToast({ message, variant });
+    setTimeout(() => setToast(null), 5000);
+  }, []);
 
-  const downloadMutation = useMutation<DownloadResponse, Error, Record<string, unknown>>({
-    mutationFn: async (body) => {
-      const res = await apiRequest("POST", "/api/data/download", body);
-      return res.json();
-    },
-    onSuccess: () => {
-      qc.invalidateQueries({ queryKey: ["/api/data/jobs"] });
-    },
-  });
+  // ─── Fetch available datasets ─────────────────────────────────────────────
 
-  const deleteMutation = useMutation<{ ok: boolean }, Error, { ticker: string; market: string; timescale: string }>({
-    mutationFn: async (body) => {
-      const res = await apiRequest("DELETE", "/api/data/dataset", body);
-      return res.json();
-    },
-    onSuccess: () => {
-      qc.invalidateQueries({ queryKey: ["/api/data/available"] });
-      if (selectedDataset) setSelectedDataset(null);
-    },
-  });
+  const fetchAvailable = useCallback(async () => {
+    const { data, engineOffline } = await apiFetch<AvailableResponse>("/api/data/available");
+    setIsEngineOffline(engineOffline);
+    setDatasets(data?.datasets ?? []);
+    setDatasetsLoading(false);
+  }, []);
+
+  useEffect(() => {
+    fetchAvailable();
+    const iv = setInterval(fetchAvailable, 10_000);
+    return () => clearInterval(iv);
+  }, [fetchAvailable]);
+
+  // ─── Fetch jobs ───────────────────────────────────────────────────────────
+
+  const fetchJobs = useCallback(async () => {
+    const { data, engineOffline } = await apiFetch<JobsResponse>("/api/data/jobs");
+    if (engineOffline) {
+      setJobs([]);
+      return;
+    }
+    setJobs(data?.jobs ?? []);
+  }, []);
+
+  useEffect(() => {
+    fetchJobs();
+    const iv = setInterval(fetchJobs, 2_000);
+    return () => clearInterval(iv);
+  }, [fetchJobs]);
+
+  // ─── Fetch preview ────────────────────────────────────────────────────────
+
+  useEffect(() => {
+    if (!selectedDataset) {
+      setPreviewData(null);
+      setPreviewEngineOffline(false);
+      return;
+    }
+    setPreviewLoading(true);
+    setPreviewEngineOffline(false);
+    const url = `/api/data/preview?ticker=${selectedDataset.ticker}&market=${selectedDataset.market}&timescale=${selectedDataset.timescale}`;
+    apiFetch<PreviewResponse>(url).then(({ data, engineOffline }) => {
+      setPreviewLoading(false);
+      if (engineOffline) {
+        setPreviewEngineOffline(true);
+        setPreviewData(null);
+      } else {
+        setPreviewData(data);
+      }
+    });
+  }, [selectedDataset]);
 
   // ─── Auto-hide completed jobs ─────────────────────────────────────────────
-
-  const jobs: DataJob[] = jobsQuery.data?.jobs ?? [];
 
   useEffect(() => {
     jobs.forEach((job) => {
@@ -291,27 +287,71 @@ export default function DataManager() {
 
   const visibleJobs = jobs.filter((j) => !hiddenJobs.has(j.job_id));
 
+  // ─── Delete mutation ──────────────────────────────────────────────────────
+
+  const [deletingKey, setDeletingKey] = useState<string | null>(null);
+
+  const handleDelete = useCallback(async (ds: DatasetInfo) => {
+    const key = `${ds.ticker}-${ds.market}-${ds.timescale}`;
+    setDeletingKey(key);
+    await apiFetch("/api/data/dataset", {
+      method: "DELETE",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ ticker: ds.ticker, market: ds.market, timescale: ds.timescale }),
+    });
+    setDeletingKey(null);
+    if (selectedDataset?.ticker === ds.ticker) setSelectedDataset(null);
+    fetchAvailable();
+  }, [selectedDataset, fetchAvailable]);
+
   // ─── Handlers ─────────────────────────────────────────────────────────────
 
-  const handleDownload = useCallback(() => {
+  const handleDownload = useCallback(async () => {
     const tickers = tickerInput
       .split(",")
       .map((t) => t.trim())
       .filter(Boolean);
-    downloadMutation.mutate({
-      market,
-      tickers,
-      timescale,
-      start_date: startDate,
-      end_date: endDate,
-      train_ratio: trainPct / 100,
-      val_ratio: valPct / 100,
+
+    setDownloadPending(true);
+    setDownloadError(null);
+    setDownloadSuccessJobId(null);
+
+    const { data, engineOffline, error } = await apiFetch<DownloadResponse>("/api/data/download", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        market,
+        tickers,
+        timescale,
+        start_date: startDate,
+        end_date: endDate,
+        train_ratio: trainPct / 100,
+        val_ratio: valPct / 100,
+      }),
     });
-  }, [tickerInput, market, timescale, startDate, endDate, trainPct, valPct, downloadMutation]);
+
+    setDownloadPending(false);
+
+    if (engineOffline) {
+      showToast("Cannot download: Python engine is offline. Start it first.", "error");
+      return;
+    }
+
+    if (error) {
+      setDownloadError(error);
+      return;
+    }
+
+    if (data?.job_id) {
+      setDownloadSuccessJobId(data.job_id);
+      fetchJobs();
+    }
+  }, [tickerInput, market, timescale, startDate, endDate, trainPct, valPct, fetchJobs, showToast]);
 
   const handleRefresh = useCallback(() => {
-    qc.invalidateQueries({ queryKey: ["/api/data/available"] });
-  }, [qc]);
+    setDatasetsLoading(true);
+    fetchAvailable();
+  }, [fetchAvailable]);
 
   const handleUseForTraining = useCallback(
     (ds: DatasetInfo) => {
@@ -327,22 +367,8 @@ export default function DataManager() {
 
   // ─── Preview data ─────────────────────────────────────────────────────────
 
-  const previewBars: PreviewBar[] =
-    previewQuery.data?.bars?.slice(-200) ??
-    (selectedDataset ? generateMockBars(selectedDataset.ticker) : []);
-
-  const previewStats: PreviewStats | null =
-    previewQuery.data?.stats ??
-    (selectedDataset
-      ? {
-          total_bars: selectedDataset.n_bars,
-          date_from: selectedDataset.created_at,
-          date_to: today(),
-          missing_pct: 0.4,
-          avg_volume: 1_250_000,
-          ann_volatility: 0.28,
-        }
-      : null);
+  const previewBars: PreviewBar[] = previewData?.bars?.slice(-200) ?? [];
+  const previewStats: PreviewStats | null = previewData?.stats ?? null;
 
   const chartData = previewBars.map((b) => ({
     time: new Date(b.t).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }),
@@ -353,6 +379,23 @@ export default function DataManager() {
 
   return (
     <div className="min-h-screen bg-background text-foreground p-4 space-y-4">
+      {/* Toast */}
+      {toast && (
+        <div
+          className={`fixed top-4 right-4 z-50 px-4 py-3 rounded-lg border text-sm font-medium shadow-lg flex items-center gap-2 ${
+            toast.variant === "error"
+              ? "bg-destructive/10 border-destructive/40 text-destructive"
+              : "bg-green-500/10 border-green-500/40 text-green-400"
+          }`}
+        >
+          <AlertCircle size={14} className="shrink-0" />
+          {toast.message}
+        </div>
+      )}
+
+      {/* Engine offline banner — shown above everything when engine is offline */}
+      {isEngineOffline && <EngineOfflineBanner />}
+
       {/* Header */}
       <div className="flex items-center gap-3 mb-2">
         <Database className="w-6 h-6 text-primary" />
@@ -522,37 +565,37 @@ export default function DataManager() {
             <div className="flex flex-col gap-2">
               <Button
                 onClick={handleDownload}
-                disabled={downloadMutation.isPending}
+                disabled={downloadPending}
                 className="w-full gap-2 text-sm"
               >
-                {downloadMutation.isPending ? (
+                {downloadPending ? (
                   <RefreshCw className="w-4 h-4 animate-spin" />
                 ) : (
                   <Download className="w-4 h-4" />
                 )}
-                {downloadMutation.isPending ? "Queuing…" : "Download & Process"}
+                {downloadPending ? "Queuing…" : "Download & Process"}
               </Button>
               <Button
                 variant="outline"
                 onClick={handleRefresh}
-                disabled={availableQuery.isFetching}
+                disabled={datasetsLoading}
                 className="w-full gap-2 text-sm border-border"
               >
-                <RefreshCw className={`w-4 h-4 ${availableQuery.isFetching ? "animate-spin" : ""}`} />
+                <RefreshCw className={`w-4 h-4 ${datasetsLoading ? "animate-spin" : ""}`} />
                 Refresh Available
               </Button>
 
               {/* Download error */}
-              {downloadMutation.isError && (
+              {downloadError && (
                 <div className="flex items-center gap-2 text-xs text-destructive bg-destructive/10 border border-destructive/20 rounded-md px-3 py-2">
                   <AlertCircle className="w-3.5 h-3.5 shrink-0" />
-                  {downloadMutation.error.message}
+                  {downloadError}
                 </div>
               )}
-              {downloadMutation.isSuccess && (
+              {downloadSuccessJobId && (
                 <div className="flex items-center gap-2 text-xs text-green-400 bg-green-400/10 border border-green-400/20 rounded-md px-3 py-2">
                   <CheckCircle2 className="w-3.5 h-3.5 shrink-0" />
-                  Job queued: {downloadMutation.data?.job_id}
+                  Job queued: {downloadSuccessJobId}
                 </div>
               )}
             </div>
@@ -568,7 +611,7 @@ export default function DataManager() {
             </CardTitle>
           </CardHeader>
           <CardContent className="p-0">
-            {availableQuery.isLoading ? (
+            {datasetsLoading ? (
               <div className="px-4 pb-4 space-y-2">
                 {[0, 1, 2].map((i) => (
                   <div key={i} className="space-y-1.5">
@@ -576,6 +619,11 @@ export default function DataManager() {
                     <Skeleton className="h-3 w-3/4" />
                   </div>
                 ))}
+              </div>
+            ) : isEngineOffline ? (
+              <div className="flex flex-col items-center justify-center py-12 px-6 text-center text-muted-foreground">
+                <AlertCircle className="w-10 h-10 mb-3 opacity-30 text-destructive" />
+                <p className="text-sm">Start the Python engine to view available datasets</p>
               </div>
             ) : datasets.length === 0 ? (
               <div className="flex flex-col items-center justify-center py-12 px-6 text-center text-muted-foreground">
@@ -603,9 +651,10 @@ export default function DataManager() {
                         selectedDataset?.ticker === ds.ticker &&
                         selectedDataset?.market === ds.market &&
                         selectedDataset?.timescale === ds.timescale;
+                      const dsKey = `${ds.ticker}-${ds.market}-${ds.timescale}`;
                       return (
                         <tr
-                          key={`${ds.ticker}-${ds.market}-${ds.timescale}`}
+                          key={dsKey}
                           onClick={() => setSelectedDataset(isSelected ? null : ds)}
                           className={`border-b border-border/50 cursor-pointer transition-colors hover:bg-primary/5 ${
                             isSelected ? "bg-primary/5 border-l-2 border-primary" : ""
@@ -656,12 +705,9 @@ export default function DataManager() {
                                 title="Delete Dataset"
                                 onClick={(e) => {
                                   e.stopPropagation();
-                                  deleteMutation.mutate({
-                                    ticker: ds.ticker,
-                                    market: ds.market,
-                                    timescale: ds.timescale,
-                                  });
+                                  handleDelete(ds);
                                 }}
+                                disabled={deletingKey === dsKey}
                                 className="p-1 rounded text-muted-foreground hover:text-destructive hover:bg-destructive/10 transition-colors"
                               >
                                 <Trash2 className="w-3.5 h-3.5" />
@@ -697,12 +743,21 @@ export default function DataManager() {
                 <BarChart2 className="w-10 h-10 mb-3 opacity-30" />
                 <p className="text-sm">Click a dataset to preview</p>
               </div>
+            ) : previewEngineOffline ? (
+              <div className="flex flex-col items-center justify-center h-[220px] text-muted-foreground">
+                <AlertCircle className="w-10 h-10 mb-3 opacity-40 text-destructive" />
+                <p className="text-sm text-destructive">Engine offline — cannot preview dataset</p>
+              </div>
             ) : (
               <div className="space-y-4">
                 {/* Chart */}
                 <div className="h-[200px]">
-                  {previewQuery.isLoading ? (
+                  {previewLoading ? (
                     <Skeleton className="w-full h-full" />
+                  ) : previewBars.length === 0 ? (
+                    <div className="flex items-center justify-center h-full text-xs text-muted-foreground">
+                      No preview data available
+                    </div>
                   ) : (
                     <ResponsiveContainer width="100%" height="100%">
                       <LineChart data={chartData} margin={{ top: 4, right: 4, bottom: 0, left: 0 }}>

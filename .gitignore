@@ -8,9 +8,32 @@ data.db-shm
 data.db-wal
 data.db-journal
 
+*.log
+.DS_Store
+
+# Python virtual environments
+.venv/
+venv/
+python_engine/.venv/
+python_engine/venv/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Local secrets
 .env
 .env.*
 !.env.example
+python_engine/.env
 
-*.log
-.DS_Store
+# Local runtime artifacts
+python_engine/logs/
+python_engine/models/
+python_engine/data/
+data.db
+
+# Build output
+dist/

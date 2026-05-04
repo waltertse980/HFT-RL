@@ -1,5 +1,4 @@
-import { useState, useEffect, useCallback, useMemo } from "react";
-import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
+import { useState, useCallback, useMemo } from "react";
 import { useLocation } from "wouter";
 import {
   LineChart,
@@ -42,7 +41,6 @@ import {
   TableRow,
 } from "@/components/ui/table";
 import { cn } from "@/lib/utils";
-import { apiRequest } from "@/lib/queryClient";
 import {
   Zap,
   Play,
@@ -55,7 +53,41 @@ import {
   ChevronUp,
   Settings2,
   Download,
+  AlertCircle,
 } from "lucide-react";
+import { useEffect, useRef } from "react";
+
+// ─── API fetch helper ─────────────────────────────────────────────────────────
+
+async function apiFetch<T>(url: string, options?: RequestInit): Promise<{ data: T | null; engineOffline: boolean; error: string | null }> {
+  try {
+    const res = await fetch(url, options);
+    if (res.status === 503) return { data: null, engineOffline: true, error: 'ENGINE_OFFLINE' };
+    if (!res.ok) {
+      const body = await res.json().catch(() => ({})) as { message?: string };
+      return { data: null, engineOffline: false, error: body.message ?? `HTTP ${res.status}` };
+    }
+    return { data: await res.json() as T, engineOffline: false, error: null };
+  } catch (err) {
+    return { data: null, engineOffline: false, error: String(err) };
+  }
+}
+
+// ─── EngineOfflineBanner ──────────────────────────────────────────────────────
+
+function EngineOfflineBanner() {
+  return (
+    <div className="mx-4 mt-4 p-3 rounded-lg border border-destructive/40 bg-destructive/10 flex items-start gap-3">
+      <AlertCircle size={16} className="text-destructive mt-0.5 shrink-0" />
+      <div>
+        <p className="text-sm font-semibold text-destructive">Python engine is offline</p>
+        <p className="text-xs text-muted-foreground mt-0.5 font-mono">
+          cd python_engine && uvicorn api_server:app --port 8001 --reload
+        </p>
+      </div>
+    </div>
+  );
+}
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -86,57 +118,7 @@ interface HpoStatus {
   eta_secs: number | null;
 }
 
-interface StudySummary {
-  study_id: string;
-  study_name: string;
-  n_trials: number;
-  best_value: number | null;
-  status: string;
-  created_at: string;
-}
-
-// ─── Mock data ─────────────────────────────────────────────────────────────────
-
-function mockTrials(n = 30): HpoTrial[] {
-  return Array.from({ length: n }, (_, i) => ({
-    number: i,
-    status: (i < n - 3 ? "complete" : (["pruned", "complete", "failed"] as const)[i % 3]),
-    value: 0.3 + Math.random() * 1.2 - (i < 5 ? 0.3 : 0),
-    params: {
-      learning_rate: parseFloat((1e-5 + Math.random() * 9e-4).toExponential(2)),
-      n_steps: ([512, 1024, 2048, 4096] as const)[i % 4],
-      batch_size: ([64, 128, 256, 512] as const)[i % 4],
-      gamma: 0.95 + Math.random() * 0.049,
-      net_arch: (["small", "medium", "large"] as const)[i % 3],
-    },
-    duration_secs: 30 + Math.random() * 120,
-  }));
-}
-
-function mockStatus(studyId: string, trials: HpoTrial[], totalTrials: number): HpoStatus {
-  const completed = trials.filter((t) => t.status === "complete");
-  const bestTrial = completed.reduce<HpoTrial | null>(
-    (best, t) => (best === null || t.value > best.value ? t : best),
-    null
-  );
-  return {
-    study_id: studyId,
-    study_name: `optuna_study_${studyId.slice(0, 6)}`,
-    n_trials_total: totalTrials,
-    n_completed: completed.length,
-    n_pruned: trials.filter((t) => t.status === "pruned").length,
-    n_failed: trials.filter((t) => t.status === "failed").length,
-    best_value: bestTrial?.value ?? null,
-    best_params: bestTrial?.params ?? null,
-    status: trials.length >= totalTrials ? "done" : "running",
-    eta_secs:
-      trials.length >= totalTrials
-        ? 0
-        : Math.max(0, (totalTrials - trials.length) * 15),
-  };
-}
-
-// ─── Helpers ───────────────────────────────────────────────────────────────────
+// ─── Helpers ──────────────────────────────────────────────────────────────────
 
 function statusColor(status: HpoTrial["status"]) {
   if (status === "complete") return "text-green-400";
@@ -205,7 +187,6 @@ function ParamRow({ name, value }: { name: string; value: string | number }) {
 
 export default function HPO() {
   const [, setLocation] = useLocation();
-  const qc = useQueryClient();
 
   // ── Config state ──────────────────────────────────────────────────────────
   const [market, setMarket] = useState<"US" | "HK">("US");
@@ -218,8 +199,15 @@ export default function HPO() {
 
   // ── Study state ───────────────────────────────────────────────────────────
   const [activeStudyId, setActiveStudyId] = useState<string | null>(null);
-  const [mockTrialsList, setMockTrialsList] = useState<HpoTrial[]>([]);
-  const [usingMock, setUsingMock] = useState(false);
+  const [isRunning, setIsRunning] = useState(false);
+  const [runPending, setRunPending] = useState(false);
+  const [stopPending, setStopPending] = useState(false);
+
+  // ── Real data from API ────────────────────────────────────────────────────
+  const [statusData, setStatusData] = useState<HpoStatus | null>(null);
+  const [trials, setTrials] = useState<HpoTrial[]>([]);
+  const [statusEngineOffline, setStatusEngineOffline] = useState(false);
+  const [trialsEngineOffline, setTrialsEngineOffline] = useState(false);
 
   // ── Sort / pagination state ───────────────────────────────────────────────
   const [sortKey, setSortKey] = useState<SortKey>("number");
@@ -227,112 +215,131 @@ export default function HPO() {
   const [page, setPage] = useState(0);
   const PAGE_SIZE = 10;
 
+  // ── Toast ─────────────────────────────────────────────────────────────────
+  const [toast, setToast] = useState<{ message: string } | null>(null);
+  const showToast = useCallback((message: string) => {
+    setToast({ message });
+    setTimeout(() => setToast(null), 5000);
+  }, []);
+
+  // ── Polling refs ──────────────────────────────────────────────────────────
+  const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
+
+  const stopPolling = useCallback(() => {
+    if (pollRef.current) {
+      clearInterval(pollRef.current);
+      pollRef.current = null;
+    }
+  }, []);
+
+  // ── Fetch status ──────────────────────────────────────────────────────────
+  const fetchStatus = useCallback(async (studyId: string) => {
+    const { data, engineOffline } = await apiFetch<HpoStatus>(`/api/hpo/status/${studyId}`);
+    if (engineOffline) {
+      setStatusEngineOffline(true);
+      setIsRunning(false);
+      stopPolling();
+      return;
+    }
+    setStatusEngineOffline(false);
+    if (data) {
+      setStatusData(data);
+      if (data.status !== "running") {
+        setIsRunning(false);
+        stopPolling();
+      }
+    }
+  }, [stopPolling]);
+
+  // ── Fetch trials ──────────────────────────────────────────────────────────
+  const fetchTrials = useCallback(async (studyId: string) => {
+    const { data, engineOffline } = await apiFetch<{ trials: HpoTrial[] }>(`/api/hpo/trials/${studyId}`);
+    if (engineOffline) {
+      setTrialsEngineOffline(true);
+      setTrials([]);
+      return;
+    }
+    setTrialsEngineOffline(false);
+    setTrials(data?.trials ?? []);
+  }, []);
+
+  // ── Start polling when we have an active study ────────────────────────────
+  useEffect(() => {
+    if (!activeStudyId || !isRunning) return;
+    // Fetch immediately
+    fetchStatus(activeStudyId);
+    fetchTrials(activeStudyId);
+    // Then poll
+    pollRef.current = setInterval(() => {
+      fetchStatus(activeStudyId);
+      fetchTrials(activeStudyId);
+    }, 2000);
+    return () => stopPolling();
+  }, [activeStudyId, isRunning, fetchStatus, fetchTrials, stopPolling]);
+
+  // ── Fetch once when study completes (not running) ─────────────────────────
+  useEffect(() => {
+    if (!activeStudyId || isRunning) return;
+    fetchStatus(activeStudyId);
+    fetchTrials(activeStudyId);
+  }, [activeStudyId, isRunning, fetchStatus, fetchTrials]);
+
   // ── API: run HPO ──────────────────────────────────────────────────────────
-  const runMutation = useMutation({
-    mutationFn: async () => {
-      const res = await apiRequest("POST", "/api/hpo/run", {
-        market,
-        timescale,
-        algo,
-        n_trials: nTrials,
-        timesteps_per_trial: timestepsPerTrial,
-        n_jobs: parseInt(nJobs),
-        storage: storage || undefined,
-      });
-      return res.json() as Promise<{ study_id: string; status: string }>;
-    },
-    onSuccess: (data) => {
-      setActiveStudyId(data.study_id);
-      setUsingMock(false);
-      setMockTrialsList([]);
-      setPage(0);
-    },
-    onError: () => {
-      // Fall back to mock
-      const id = `mock_${Date.now()}`;
-      setActiveStudyId(id);
-      setUsingMock(true);
-      setMockTrialsList([]);
-      setPage(0);
-    },
-  });
+  const handleRun = useCallback(async () => {
+    setRunPending(true);
+    const { data, engineOffline, error } = await apiFetch<{ study_id: string; status: string }>(
+      "/api/hpo/run",
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          market,
+          timescale,
+          algo,
+          n_trials: nTrials,
+          timesteps_per_trial: timestepsPerTrial,
+          n_jobs: parseInt(nJobs),
+          storage: storage || undefined,
+        }),
+      }
+    );
+    setRunPending(false);
+
+    if (engineOffline) {
+      showToast("Cannot run HPO: Python engine is offline. Start it first.");
+      setIsRunning(false);
+      return;
+    }
+
+    if (error || !data?.study_id) {
+      showToast(error ?? "Failed to start HPO study");
+      setIsRunning(false);
+      return;
+    }
+
+    setActiveStudyId(data.study_id);
+    setStatusData(null);
+    setTrials([]);
+    setStatusEngineOffline(false);
+    setTrialsEngineOffline(false);
+    setPage(0);
+    setIsRunning(true);
+  }, [market, timescale, algo, nTrials, timestepsPerTrial, nJobs, storage, showToast]);
 
   // ── API: stop HPO ─────────────────────────────────────────────────────────
-  const stopMutation = useMutation({
-    mutationFn: async () => {
-      if (!activeStudyId || usingMock) return;
-      const res = await apiRequest("POST", `/api/hpo/stop/${activeStudyId}`);
-      return res.json();
-    },
-    onSuccess: () => {
-      qc.invalidateQueries({ queryKey: ["/api/hpo/status", activeStudyId] });
-    },
-    onSettled: () => {
-      if (usingMock) {
-        setMockTrialsList((prev) => {
-          const t = mockTrials(nTrials);
-          return t.slice(0, Math.max(prev.length, 1));
-        });
-      }
-    },
-  });
+  const handleStop = useCallback(async () => {
+    if (!activeStudyId) return;
+    setStopPending(true);
+    await apiFetch(`/api/hpo/stop/${activeStudyId}`, { method: "POST" });
+    setStopPending(false);
+    setIsRunning(false);
+    stopPolling();
+    // Fetch final state
+    fetchStatus(activeStudyId);
+    fetchTrials(activeStudyId);
+  }, [activeStudyId, stopPolling, fetchStatus, fetchTrials]);
 
-  // ── API: poll status ──────────────────────────────────────────────────────
-  const { data: statusData } = useQuery<HpoStatus>({
-    queryKey: ["/api/hpo/status", activeStudyId],
-    enabled: !!activeStudyId && !usingMock,
-    refetchInterval: (query) => {
-      const data = query.state.data as HpoStatus | undefined;
-      return data?.status === "running" ? 2000 : false;
-    },
-    retry: false,
-  });
-
-  // ── API: fetch trials ─────────────────────────────────────────────────────
-  const { data: trialsData } = useQuery<{ trials: HpoTrial[] }>({
-    queryKey: ["/api/hpo/trials", activeStudyId],
-    enabled: !!activeStudyId && !usingMock,
-    refetchInterval: (query) => {
-      const status = qc.getQueryData<HpoStatus>(["/api/hpo/status", activeStudyId]);
-      return status?.status === "running" ? 3000 : false;
-    },
-    retry: false,
-  });
-
-  // ── Mock simulation ───────────────────────────────────────────────────────
-  useEffect(() => {
-    if (!usingMock || !activeStudyId) return;
-    const fullSet = mockTrials(nTrials);
-    let current = 0;
-    const addTrial = () => {
-      current++;
-      setMockTrialsList(fullSet.slice(0, current));
-    };
-    // Add one immediately then every 400ms
-    addTrial();
-    const iv = setInterval(() => {
-      if (current >= fullSet.length) {
-        clearInterval(iv);
-        return;
-      }
-      addTrial();
-    }, 400);
-    return () => clearInterval(iv);
-  }, [usingMock, activeStudyId, nTrials]);
-
-  // ── Resolved data ─────────────────────────────────────────────────────────
-  const trials: HpoTrial[] = usingMock
-    ? mockTrialsList
-    : trialsData?.trials ?? [];
-
-  const status: HpoStatus | null = usingMock && activeStudyId
-    ? mockStatus(activeStudyId, mockTrialsList, nTrials)
-    : statusData ?? null;
-
-  const isRunning =
-    (usingMock && activeStudyId !== null && mockTrialsList.length < nTrials) ||
-    (!usingMock && status?.status === "running");
-
+  // ── Derived best trial ────────────────────────────────────────────────────
   const bestTrial = useMemo(() => {
     const completed = trials.filter((t) => t.status === "complete");
     return completed.reduce<HpoTrial | null>(
@@ -411,14 +418,28 @@ export default function HPO() {
   };
 
   // ── Progress ──────────────────────────────────────────────────────────────
-  const progressPct = status
-    ? Math.round((status.n_completed / Math.max(status.n_trials_total, 1)) * 100)
+  const progressPct = statusData
+    ? Math.round((statusData.n_completed / Math.max(statusData.n_trials_total, 1)) * 100)
     : 0;
+
+  // ── Engine offline: any endpoint offline means we show the banner ─────────
+  const anyEngineOffline = statusEngineOffline || trialsEngineOffline;
 
   // ── Render ────────────────────────────────────────────────────────────────
 
   return (
     <div className="flex flex-col h-full overflow-hidden" data-testid="page-hpo">
+      {/* Toast */}
+      {toast && (
+        <div className="fixed top-4 right-4 z-50 px-4 py-3 rounded-lg border bg-destructive/10 border-destructive/40 text-destructive text-sm font-medium shadow-lg flex items-center gap-2">
+          <AlertCircle size={14} className="shrink-0" />
+          {toast.message}
+        </div>
+      )}
+
+      {/* Engine offline banner */}
+      {anyEngineOffline && <EngineOfflineBanner />}
+
       {/* Page header */}
       <div className="border-b border-border px-6 py-3 flex items-center justify-between shrink-0">
         <h1 className="text-sm font-sans font-semibold text-foreground flex items-center gap-2">
@@ -429,14 +450,16 @@ export default function HPO() {
               <RefreshCw size={10} className="animate-spin" /> Running
             </span>
           )}
-          {status?.status === "done" && (
+          {statusData?.status === "done" && (
             <span className="flex items-center gap-1 text-green-400 text-xs font-mono">
               <Trophy size={10} /> Done
             </span>
           )}
         </h1>
         <span className="text-xs text-muted-foreground font-mono">
-          {usingMock && activeStudyId ? "mock mode" : activeStudyId ? `study: ${status?.study_name ?? activeStudyId}` : "no active study"}
+          {activeStudyId
+            ? `study: ${statusData?.study_name ?? activeStudyId}`
+            : "no active study"}
         </span>
       </div>
 
@@ -553,8 +576,8 @@ export default function HPO() {
                 <div className="flex gap-2 mt-auto">
                   <Button
                     className="flex-1 h-8 text-xs bg-primary hover:bg-primary/90 text-primary-foreground"
-                    onClick={() => runMutation.mutate()}
-                    disabled={isRunning || runMutation.isPending}
+                    onClick={handleRun}
+                    disabled={isRunning || runPending}
                     data-testid="btn-run-hpo"
                   >
                     <Play size={11} className="mr-1" />
@@ -565,8 +588,8 @@ export default function HPO() {
                       variant="destructive"
                       size="sm"
                       className="h-8 text-xs px-3"
-                      onClick={() => stopMutation.mutate()}
-                      disabled={stopMutation.isPending}
+                      onClick={handleStop}
+                      disabled={stopPending}
                       data-testid="btn-stop-hpo"
                     >
                       <Square size={11} className="mr-1" />
@@ -591,13 +614,17 @@ export default function HPO() {
                 </CardTitle>
               </CardHeader>
               <CardContent className="p-4 space-y-4">
-                {status ? (
+                {statusEngineOffline ? (
+                  <p className="text-xs text-destructive font-sans text-center py-6">
+                    Engine offline — status unavailable.
+                  </p>
+                ) : statusData ? (
                   <>
                     {/* Study meta */}
                     <div className="grid grid-cols-2 sm:grid-cols-3 gap-3">
                       <div>
                         <p className="text-xs text-muted-foreground mb-0.5">Study</p>
-                        <p className="text-xs font-mono text-foreground truncate">{status.study_name}</p>
+                        <p className="text-xs font-mono text-foreground truncate">{statusData.study_name}</p>
                       </div>
                       <div>
                         <p className="text-xs text-muted-foreground mb-0.5">Algorithm</p>
@@ -606,20 +633,20 @@ export default function HPO() {
                       <div>
                         <p className="text-xs text-muted-foreground mb-0.5">Best Value</p>
                         <p className="text-xs font-mono text-primary font-semibold">
-                          {status.best_value !== null ? status.best_value.toFixed(4) : "—"}
+                          {statusData.best_value !== null ? statusData.best_value.toFixed(4) : "—"}
                         </p>
                       </div>
                       <div>
                         <p className="text-xs text-muted-foreground mb-0.5">Completed</p>
-                        <p className="text-xs font-mono text-green-400">{status.n_completed}</p>
+                        <p className="text-xs font-mono text-green-400">{statusData.n_completed}</p>
                       </div>
                       <div>
                         <p className="text-xs text-muted-foreground mb-0.5">Pruned</p>
-                        <p className="text-xs font-mono text-amber-400">{status.n_pruned}</p>
+                        <p className="text-xs font-mono text-amber-400">{statusData.n_pruned}</p>
                       </div>
                       <div>
                         <p className="text-xs text-muted-foreground mb-0.5">Failed</p>
-                        <p className="text-xs font-mono text-destructive">{status.n_failed}</p>
+                        <p className="text-xs font-mono text-destructive">{statusData.n_failed}</p>
                       </div>
                     </div>
 
@@ -627,7 +654,7 @@ export default function HPO() {
                     <div className="space-y-1.5">
                       <div className="flex items-center justify-between text-xs">
                         <span className="text-muted-foreground font-sans">
-                          {status.n_completed} / {status.n_trials_total} trials
+                          {statusData.n_completed} / {statusData.n_trials_total} trials
                         </span>
                         <span className="font-mono text-foreground">{progressPct}%</span>
                       </div>
@@ -639,21 +666,21 @@ export default function HPO() {
                       <Clock size={11} />
                       ETA:{" "}
                       <span className="text-foreground">
-                        {status.eta_secs !== null ? formatEta(status.eta_secs) : "—"}
+                        {statusData.eta_secs !== null ? formatEta(statusData.eta_secs) : "—"}
                       </span>
                       <span className="ml-2">
                         Status:{" "}
                         <Badge
                           className={cn(
                             "text-xs px-1.5 py-0 font-mono border",
-                            status.status === "running"
+                            statusData.status === "running"
                               ? "bg-amber-500/10 text-amber-400 border-amber-500/30"
-                              : status.status === "done"
+                              : statusData.status === "done"
                               ? "bg-green-500/10 text-green-400 border-green-500/30"
                               : "bg-destructive/10 text-destructive border-destructive/30"
                           )}
                         >
-                          {status.status}
+                          {statusData.status}
                         </Badge>
                       </span>
                     </div>
@@ -775,7 +802,14 @@ export default function HPO() {
                 </CardTitle>
               </CardHeader>
               <CardContent className="p-4 space-y-4">
-                {bestTrial ? (
+                {anyEngineOffline ? (
+                  <div className="flex flex-col items-center justify-center py-12 text-center">
+                    <AlertCircle size={28} className="text-destructive/40 mb-3" />
+                    <p className="text-xs text-destructive font-sans">
+                      Best parameters not available — engine offline
+                    </p>
+                  </div>
+                ) : bestTrial ? (
                   <>
                     <div className="rounded-md border border-yellow-500/30 bg-yellow-500/5 p-3 space-y-0.5">
                       <ParamRow name="learning_rate" value={bestTrial.params.learning_rate.toExponential(2)} />
@@ -857,7 +891,11 @@ export default function HPO() {
             </div>
           </CardHeader>
           <CardContent className="p-0">
-            {trials.length > 0 ? (
+            {trialsEngineOffline ? (
+              <div className="flex items-center justify-center py-16 text-xs text-muted-foreground font-sans">
+                No trial data — engine offline
+              </div>
+            ) : trials.length > 0 ? (
               <>
                 <div className="overflow-x-auto">
                   <Table>
