@@ -36,7 +36,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 from gymnasium import spaces
-from stable_baselines3.common.vec_env import SubprocVecEnv, VecEnv
+from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv, VecEnv
 
 matplotlib.use("Agg")
 
@@ -662,7 +662,7 @@ def make_envs(
                 max_position=max_position,
                 market=market,
             )
-        return SubprocVecEnv([_mm_init] * n_envs)
+        return DummyVecEnv([_mm_init] * n_envs)
 
     ticker, df = next(iter(data_dict.items()))
     logger.info("Creating %d parallel envs for ticker=%s market=%s", n_envs, ticker, market)
@@ -679,7 +679,10 @@ def make_envs(
             )
         return _init
 
-    return SubprocVecEnv([_make(df)] * n_envs)
+    # DummyVecEnv runs envs in-process (no subprocess pipes).
+    # On Windows, SubprocVecEnv uses 'spawn' which is slow and fragile
+    # when the parent process is uvicorn with --reload.
+    return DummyVecEnv([_make(df)] * n_envs)
 
 
 # ---------------------------------------------------------------------------

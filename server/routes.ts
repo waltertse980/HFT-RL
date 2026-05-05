@@ -289,7 +289,40 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
   app.get('/api/training/jobs', async (_req: Request, res: Response) => {
     try {
       const jobs = await storage.getAllJobs();
-      res.json(jobs);
+
+      // For any job that is pending/running in SQLite, fetch live status from
+      // Python and update the DB so the UI always sees real progress.
+      const liveUpdates = await Promise.allSettled(
+        jobs
+          .filter((j: { status: string }) => j.status === 'pending' || j.status === 'running')
+          .map(async (j: { jobId: string }) => {
+            try {
+              const r = await callPython<{
+                status: string;
+                progress_pct: number;
+                current_reward?: number;
+                model_path?: string;
+                error_msg?: string;
+                completed_at?: string;
+              }>(`/train/${j.jobId}/status`);
+              const d = r.data;
+              await storage.updateJob(j.jobId, {
+                status: d.status,
+                progressPct: d.progress_pct,
+                currentReward: d.current_reward ?? null,
+                modelPath: d.model_path ?? null,
+                errorMsg: d.error_msg ?? null,
+                completedAt: d.completed_at ?? null,
+              });
+            } catch (_) {
+              // Python offline or job gone — leave SQLite as-is
+            }
+          })
+      );
+      void liveUpdates; // fire-and-wait, ignore individual failures
+      
+      const refreshed = await storage.getAllJobs();
+      res.json(refreshed);
     } catch (err) {
       res.status(500).json({ error: String(err) });
     }
@@ -395,7 +428,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
       res.json({ ok: true, status: 'gone', msg: 'Engine offline — job dismissed locally' });
     }
   });
-  
+
   // Dismiss a job from memory entirely (client-side removal for orphans)
   app.delete('/api/training/jobs/:jobId', async (req: Request<ParamsDictionary>, res: Response) => {
     try {

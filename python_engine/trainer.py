@@ -303,6 +303,7 @@ def _build_ppo(
         max_grad_norm=0.5,
         policy_kwargs=policy_kwargs,
         tensorboard_log=str(LOG_DIR / "ppo_tensorboard") if _TENSORBOARD_OK else None,
+        device="cpu",   # PPO+MLP is faster on CPU; GPU overhead dominates for small nets
         verbose=1,
     )
     logger.info("PPO model created — total_timesteps=%d", total_timesteps)
@@ -765,7 +766,6 @@ def evaluate_model(
     model = ModelClass.load(model_path, env=vec_env)
 
     # ── Run evaluation rollouts ───────────────────────────────────────────────
-    all_step_returns: list[float] = []
     all_portfolio_histories: list[list[float]] = []
     all_n_trades: list[int] = []
     all_realized_pnl: list[float] = []
@@ -775,8 +775,7 @@ def evaluate_model(
     for episode in range(n_eval_episodes):
         obs = vec_env.reset()
         done = False
-        portfolio_history = [initial_capital]
-        step_returns: list[float] = []
+        portfolio_history: list[float] = [float(initial_capital)]
         ep_n_trades = 0
         ep_realized_pnl = 0.0
 
@@ -785,50 +784,93 @@ def evaluate_model(
             obs, reward, done_arr, info_arr = vec_env.step(action)
             done = bool(done_arr[0])
 
-            if info_arr and len(info_arr) > 0:
-                info = info_arr[0]
-                pv = float(info.get("portfolio_value", initial_capital))
-                portfolio_history.append(pv)
-                ep_n_trades = int(info.get("n_trades", 0))
-                ep_realized_pnl = float(info.get("realized_pnl", 0.0))
+            # info_arr[0] may be a dict (Monitor) or a StepInfo-derived dict
+            raw_info = (info_arr[0] if (info_arr is not None and len(info_arr) > 0) else {})
+            # Handle both dict and object (Monitor wraps info into a dict)
+            if hasattr(raw_info, "get"):
+                info = raw_info
+            elif hasattr(raw_info, "__dict__"):
+                info = raw_info.__dict__
+            else:
+                info = {}
 
-            step_returns.append(float(reward[0]))
+            pv = info.get("portfolio_value", None)
+            if pv is not None and np.isfinite(float(pv)):
+                portfolio_history.append(float(pv))
+            ep_n_trades = int(info.get("n_trades", ep_n_trades))
+            rpnl = info.get("realized_pnl", None)
+            if rpnl is not None and np.isfinite(float(rpnl)):
+                ep_realized_pnl = float(rpnl)
 
-        total_return = (portfolio_history[-1] - initial_capital) / initial_capital
-        episode_total_returns.append(total_return)
-        all_step_returns.extend(step_returns)
+        # ── Per-episode metrics ──────────────────────────────────────────────
+        final_pv = portfolio_history[-1] if len(portfolio_history) > 1 else initial_capital
+        ep_total_return = (final_pv - initial_capital) / initial_capital
+        if not np.isfinite(ep_total_return):
+            ep_total_return = 0.0
+        episode_total_returns.append(ep_total_return)
         all_portfolio_histories.append(portfolio_history)
         all_n_trades.append(ep_n_trades)
         all_realized_pnl.append(ep_realized_pnl)
-        wins.append(total_return > 0.0)
+        # Win = episode ended with positive realized PnL (not total_return which can
+        # include unrealized marks that never close).
+        wins.append(ep_realized_pnl > 0.0)
 
         logger.debug(
-            "Episode %d/%d — total_return=%.4f  n_trades=%d",
-            episode + 1, n_eval_episodes, total_return, ep_n_trades,
+            "Episode %d/%d — total_return=%.4f  realized_pnl=%.4f  n_trades=%d  "
+            "portfolio_start=%.2f  portfolio_end=%.2f",
+            episode + 1, n_eval_episodes,
+            ep_total_return, ep_realized_pnl, ep_n_trades,
+            portfolio_history[0], portfolio_history[-1],
         )
 
     vec_env.close()
 
     # ── Aggregate metrics ─────────────────────────────────────────────────────
-    returns_arr = np.array(all_step_returns, dtype=np.float64)
-    mean_ret = float(np.mean(returns_arr))
-    std_ret  = float(np.std(returns_arr)) if len(returns_arr) > 1 else 1e-8
-    sharpe   = (mean_ret / (std_ret + 1e-8)) * annualisation
+    # Sharpe: computed from per-bar portfolio *return* (not RL reward scalars)
+    # Concatenate all bar-level portfolio values, compute bar returns, then
+    # annualise.  This is the correct financial definition.
+    all_bar_returns: list[float] = []
+    for hist in all_portfolio_histories:
+        hist_arr = np.array(hist, dtype=np.float64)
+        if len(hist_arr) < 2:
+            continue
+        bar_rets = np.diff(hist_arr) / (hist_arr[:-1] + 1e-8)  # % change per bar
+        # Remove any non-finite values (price gaps, first-step anomalies)
+        bar_rets = bar_rets[np.isfinite(bar_rets)]
+        all_bar_returns.extend(bar_rets.tolist())
+
+    if len(all_bar_returns) > 1:
+        ret_arr  = np.array(all_bar_returns, dtype=np.float64)
+        mean_ret = float(np.nanmean(ret_arr))
+        std_ret  = float(np.nanstd(ret_arr))
+        if std_ret < 1e-10:
+            sharpe = 0.0  # zero-volatility: undefined, treat as 0
+        else:
+            sharpe = (mean_ret / std_ret) * annualisation
+        # Clamp to a plausible range — anything > 10 is suspicious
+        sharpe = float(np.clip(sharpe, -50.0, 50.0))
+    else:
+        sharpe = 0.0
 
     # Max drawdown across all episodes (worst single episode)
     max_drawdown = 0.0
     for hist in all_portfolio_histories:
         hist_arr = np.array(hist, dtype=np.float64)
+        if len(hist_arr) < 2:
+            continue
         running_max = np.maximum.accumulate(hist_arr)
-        drawdowns = (running_max - hist_arr) / (running_max + 1e-8)
-        ep_dd = float(np.max(drawdowns))
-        if ep_dd > max_drawdown:
+        # Avoid divide-by-zero when running_max is 0 (degenerate)
+        denom = np.where(running_max > 1e-8, running_max, 1e-8)
+        drawdowns = (running_max - hist_arr) / denom
+        ep_dd = float(np.nanmax(drawdowns))
+        if np.isfinite(ep_dd) and ep_dd > max_drawdown:
             max_drawdown = ep_dd
 
-    win_rate      = float(np.mean(wins)) if wins else 0.0
-    total_return  = float(np.mean(episode_total_returns))
-    total_trades  = int(np.sum(all_n_trades))
-    total_pnl     = float(np.sum(all_realized_pnl))
+    win_rate   = float(np.mean(wins)) if wins else 0.0
+    ep_returns = [r for r in episode_total_returns if np.isfinite(r)]
+    total_return = float(np.mean(ep_returns)) if ep_returns else 0.0
+    total_trades = int(np.sum(all_n_trades))
+    total_pnl    = float(np.nansum(all_realized_pnl))
     avg_pnl_per_trade = total_pnl / max(total_trades, 1)
 
     metrics: EvalMetrics = {

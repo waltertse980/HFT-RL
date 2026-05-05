@@ -219,19 +219,30 @@ def _train_worker(job_id: str, req: TrainRequest) -> None:
                 progress_cb=_progress_cb,
             )
 
-            # Evaluate for meta.json metrics
+            # Evaluate for meta.json metrics — use proper 10% test split
             eval_metrics: dict = {}
             try:
                 from data_pipeline import compute_features
-                test_df = compute_features(list(data_dict.values())[0])
+                from trainer import split_data
+                # Use same 60/30/10 split as train_model so we evaluate on
+                # held-out test data only, not the full dataset.
+                primary_raw = list(data_dict.values())[0]
+                featured_df = compute_features(primary_raw)
+                _, _, test_df = split_data(featured_df, 0.6, 0.3, 0.1)
+                # Find the vecnorm saved by train_model
+                _ckpt_dir = Path(model_path).parent
+                _vecnorm  = str(_ckpt_dir / "vecnorm.pkl") if (_ckpt_dir / "vecnorm.pkl").exists() else None
                 raw = evaluate_model(
                     model_path=model_path,
                     test_data=test_df,
                     algorithm=req.algo,
+                    market=req.market,
+                    timescale=req.timescale,
+                    vecnorm_path=_vecnorm,
                 )
                 eval_metrics = dict(raw)
             except Exception as eval_exc:
-                log.warning("evaluate_model failed: %s", eval_exc)
+                log.warning("evaluate_model failed: %s", eval_exc, exc_info=True)
 
             # Write rich meta.json
             model_dir = Path(model_path).parent
