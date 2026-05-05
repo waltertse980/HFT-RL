@@ -202,20 +202,6 @@ def _train_worker(job_id: str, req: TrainRequest) -> None:
         import stable_baselines3  # noqa: F401
         from data_pipeline import load_dataset
 
-        # Probe for the tensorflow.io issue before calling train_model so we
-        # get a clean fallback instead of a mid-training crash.
-        try:
-            import tensorflow as _tf
-            _ = _tf.io
-        except Exception as _tf_exc:
-            log.warning(
-                "TensorBoard probe failed (%s) — patching tensorboard_log=None "
-                "in trainer before importing.", _tf_exc
-            )
-            # Monkey-patch the broken tensorboard_log out of SB3's PPO/TD3 init
-            import trainer as _trainer_mod
-            _trainer_mod._TENSORBOARD_OK = False
-
         from trainer import train_model, evaluate_model
 
         data_dict = load_dataset(req.market, req.timescale)
@@ -230,7 +216,7 @@ def _train_worker(job_id: str, req: TrainRequest) -> None:
                 algorithm=req.algo,
                 total_timesteps=req.timesteps,
                 n_envs=4,
-                progress_cb=_progress_cb,                
+                progress_cb=_progress_cb,
             )
 
             # Evaluate for meta.json metrics
@@ -285,7 +271,11 @@ def _train_worker(job_id: str, req: TrainRequest) -> None:
             return
 
     except Exception as exc:
-        log.info("Real training unavailable (%s), running simulation.", exc)
+        import traceback as _tb
+        log.error(
+            "Real training unavailable (%s)\nFull traceback:\n%s",
+            exc, _tb.format_exc()
+        )
 
     # ── Simulation fallback ────────────────────────────────────────────────
     interval = 0.5

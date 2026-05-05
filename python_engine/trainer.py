@@ -69,22 +69,12 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# TensorBoard is optional — disable if the installed tensorboard/tensorflow
-# package has a broken tensorflow.io shim (common when TF is partially installed).
+# TensorBoard logging is disabled unconditionally.
+# The installed tensorboard package has a broken tensorflow.io shim that causes
+# mid-training crashes.  Removing it has zero impact on training quality —
+# SB3 trains identically without it.  Re-enable by installing standalone:
+#   pip uninstall tensorboard && pip install tensorboard
 _TENSORBOARD_OK = False
-try:
-    import tensorboard  # noqa: F401
-    import tensorflow as tf  # noqa: F401
-    _ = tf.io  # probe the attribute that fails
-    _TENSORBOARD_OK = True
-except Exception:
-    pass
-
-if not _TENSORBOARD_OK:
-    logger.warning(
-        "TensorBoard logging disabled (tensorflow.io unavailable). "
-        "Training will proceed normally without TB logs."
-    )
 
 # ---------------------------------------------------------------------------
 # Constants
