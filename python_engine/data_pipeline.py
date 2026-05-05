@@ -41,8 +41,16 @@ from typing import Optional
 
 import numpy as np
 import pandas as pd
-import yfinance as yf
 from tqdm import tqdm
+
+# yfinance is an optional fallback — Alpaca is the primary source for US data.
+# If yfinance is not installed, HK data will be unavailable until Futu OpenAPI
+# is integrated.  Install with: pip install yfinance
+try:
+    import yfinance as yf
+    _YFINANCE_AVAILABLE = True
+except ImportError:
+    _YFINANCE_AVAILABLE = False
 
 # ---------------------------------------------------------------------------
 # Optional Alpaca import (US L1 data)
@@ -90,6 +98,11 @@ def _download_single_yf(
     retries: int = DOWNLOAD_RETRIES,
 ) -> Optional[pd.DataFrame]:
     """Download OHLCV data for a single ticker via yfinance with retry."""
+    if not _YFINANCE_AVAILABLE:
+        raise ImportError(
+            "yfinance is not installed. For US stocks, configure Alpaca API keys in Settings. "
+            "For HK stocks, install yfinance: pip install yfinance"
+        )
     for attempt in range(1, retries + 1):
         try:
             df = yf.download(
@@ -115,10 +128,35 @@ def _download_single_yf(
     return None
 
 
+def _parse_date_range(
+    start: Optional[str],
+    end: Optional[str],
+    default_days: int = 7,
+) -> tuple[datetime, datetime]:
+    """
+    Resolve an explicit start/end date string pair into datetime objects.
+
+    If start is None, defaults to ``default_days`` days before end.
+    If end is None, defaults to now (UTC).
+    Accepts ISO-8601 strings: '2026-01-01', '2026-01-01T00:00:00', etc.
+    """
+    end_dt: datetime = (
+        datetime.fromisoformat(end.replace("Z", "")) if end else datetime.utcnow()
+    )
+    start_dt: datetime = (
+        datetime.fromisoformat(start.replace("Z", ""))
+        if start
+        else end_dt - timedelta(days=default_days)
+    )
+    return start_dt, end_dt
+
+
 def download_us_data(
     tickers: list[str] = US_TICKERS,
     period: str = "60d",
     interval: str = "1m",
+    start: Optional[str] = None,
+    end: Optional[str] = None,
 ) -> dict[str, pd.DataFrame]:
     """
     Download US OHLCV data.
@@ -128,26 +166,41 @@ def download_us_data(
 
     Parameters
     ----------
-    period:   '7d' gives 1-week of 1m bars (yfinance limit); '60d' works for
-              5m+ bars.  Alpaca supports up to 2 years for 1m.
+    period:   Relative window used ONLY when start/end are both None.
+              '7d', '60d', '365d'.  Alpaca supports up to 2 years for 1m.
     interval: '1m', '5m', '1h'
+    start:    ISO-8601 date string e.g. '2026-01-01' (takes priority over period)
+    end:      ISO-8601 date string e.g. '2026-05-04' (defaults to today)
     """
     result: dict[str, pd.DataFrame] = {}
 
     api_key = os.environ.get("ALPACA_API_KEY")
     api_secret = os.environ.get("ALPACA_API_SECRET")
 
+    # Resolve date range: explicit start/end take priority over period
+    if start or end:
+        default_days = int(period.replace("d", "")) if period.endswith("d") else 7
+        start_dt, end_dt = _parse_date_range(start, end, default_days=default_days)
+    else:
+        days = int(period.replace("d", "")) if period.endswith("d") else 7
+        end_dt = datetime.utcnow()
+        start_dt = end_dt - timedelta(days=days)
+
+    logger.info(
+        "US download window: %s → %s (interval=%s)",
+        start_dt.date(), end_dt.date(), interval,
+    )
+
     if _ALPACA_AVAILABLE and api_key and api_secret:
         logger.info("Using Alpaca IEX feed for US data.")
         try:
             client = StockHistoricalDataClient(api_key, api_secret)
-            tf_map = {"1m": TimeFrame(1, TimeFrameUnit.Minute),
-                      "5m": TimeFrame(5, TimeFrameUnit.Minute),
-                      "1h": TimeFrame(1, TimeFrameUnit.Hour)}
+            tf_map = {
+                "1m":  TimeFrame(1,  TimeFrameUnit.Minute),
+                "5m":  TimeFrame(5,  TimeFrameUnit.Minute),
+                "1h":  TimeFrame(1,  TimeFrameUnit.Hour),
+            }
             tf = tf_map.get(interval, TimeFrame(1, TimeFrameUnit.Minute))
-            days = int(period.replace("d", ""))
-            end_dt = datetime.utcnow()
-            start_dt = end_dt - timedelta(days=days)
             req = StockBarsRequest(
                 symbol_or_symbols=tickers,
                 timeframe=tf,
@@ -174,9 +227,12 @@ def download_us_data(
         except Exception as exc:
             logger.warning("Alpaca download failed (%s), falling back to yfinance.", exc)
 
-    # yfinance fallback
+    # yfinance fallback — period string only (no explicit date range support)
+    yf_period = period if not (start or end) else (
+        f"{max(1, (end_dt - start_dt).days)}d"
+    )
     for ticker in tqdm(tickers, desc="US tickers (yfinance)"):
-        df = _download_single_yf(ticker, period, interval)
+        df = _download_single_yf(ticker, yf_period, interval)
         if df is not None:
             result[ticker] = df
     return result
@@ -186,15 +242,35 @@ def download_hk_data(
     tickers: list[str] = HK_TICKERS,
     period: str = "60d",
     interval: str = "1m",
+    start: Optional[str] = None,
+    end: Optional[str] = None,
 ) -> dict[str, pd.DataFrame]:
     """
     Download HKEX OHLCV data via yfinance.
 
     Upgrade path: replace with Futu OpenAPI for true L2 data.
+
+    Parameters
+    ----------
+    start/end: ISO-8601 date strings.  When provided, the period is computed
+               from the date delta and passed to yfinance (which only accepts
+               relative periods for intraday intervals).
     """
     result: dict[str, pd.DataFrame] = {}
+
+    if start or end:
+        default_days = int(period.replace("d", "")) if period.endswith("d") else 60
+        start_dt, end_dt = _parse_date_range(start, end, default_days=default_days)
+        yf_period = f"{max(1, (end_dt - start_dt).days)}d"
+        logger.info(
+            "HK download window: %s → %s → yfinance period=%s (interval=%s)",
+            start_dt.date(), end_dt.date(), yf_period, interval,
+        )
+    else:
+        yf_period = period
+
     for ticker in tqdm(tickers, desc="HK tickers"):
-        df = _download_single_yf(ticker, period, interval)
+        df = _download_single_yf(ticker, yf_period, interval)
         if df is not None:
             result[ticker] = df
     return result
@@ -508,32 +584,68 @@ def load_dataset(
     market: str,
     timescale: str,
     ticker: Optional[str] = None,
+    tickers: Optional[list] = None,
+    start: Optional[str] = None,
+    end: Optional[str] = None,
 ) -> dict[str, pd.DataFrame]:
     """
     Load a previously saved market dataset.
 
+    Supports two storage formats (newest takes priority):
+    1. Per-ticker parquet: ``{TICKER}_{market}_{timescale}.parquet``  ← new format
+    2. Monolithic pickle:  ``{market}_{timescale}.pkl``               ← legacy format
+
     Parameters
     ----------
-    market:    'us' or 'hk'
+    market:    'us' or 'hk' (case-insensitive)
     timescale: '10s', '1m', '5m', '1h'
-    ticker:    If provided, return only that ticker's DataFrame wrapped in a
-               single-entry dict.  Avoids deserialising the full file for
-               single-ticker workflows.
+    ticker:    Single ticker filter (legacy kwarg, prefer ``tickers``)
+    tickers:   List of tickers to load. If None, loads all available.
+    start/end: Ignored here (used by download functions); accepted for
+               API compatibility.
     """
-    path = DATA_DIR / f"{market}_{timescale}.pkl"
-    if not path.exists():
-        raise FileNotFoundError(
-            f"Dataset not found at {path}. Run:\n"
-            f"  python data_pipeline.py --market {market} --timescale {timescale}"
-        )
-    with open(path, "rb") as f:
-        data: dict[str, pd.DataFrame] = pickle.load(f)
+    market = market.lower()
+    filter_tickers: Optional[list] = None
     if ticker is not None:
-        if ticker not in data:
-            raise KeyError(f"Ticker '{ticker}' not in dataset. Available: {list(data.keys())}")
-        data = {ticker: data[ticker]}
-    logger.info("Loaded dataset from %s (%d tickers)", path, len(data))
-    return data
+        filter_tickers = [ticker]
+    elif tickers:
+        filter_tickers = list(tickers)
+
+    # ── 1. Try per-ticker parquet files (new format) ──────────────────
+    parquet_files = list(DATA_DIR.glob(f"*_{market}_{timescale}.parquet"))
+    if parquet_files:
+        data: dict[str, pd.DataFrame] = {}
+        for f in parquet_files:
+            tkr = f.stem.split("_")[0].upper()
+            if filter_tickers and tkr not in [t.upper() for t in filter_tickers]:
+                continue
+            try:
+                data[tkr] = pd.read_parquet(str(f))
+            except Exception as exc:
+                logger.warning("Failed to load %s: %s", f.name, exc)
+        if data:
+            logger.info(
+                "Loaded %d ticker(s) from parquet (%s/%s): %s",
+                len(data), market, timescale, sorted(data.keys()),
+            )
+            return data
+
+    # ── 2. Fall back to legacy monolithic pickle ─────────────────────
+    pkl_path = DATA_DIR / f"{market}_{timescale}.pkl"
+    if pkl_path.exists():
+        with open(pkl_path, "rb") as f:
+            data = pickle.load(f)
+        if filter_tickers:
+            data = {k: v for k, v in data.items() if k.upper() in [t.upper() for t in filter_tickers]}
+        logger.info("Loaded dataset from pickle %s (%d tickers)", pkl_path, len(data))
+        return data
+
+    raise FileNotFoundError(
+        f"No dataset found for market='{market}' timescale='{timescale}'. "
+        f"Expected parquet files matching '*_{market}_{timescale}.parquet' "
+        f"or pickle '{market}_{timescale}.pkl' in {DATA_DIR}. "
+        "Download data first via the Data Manager."
+    )
 
 
 # ---------------------------------------------------------------------------

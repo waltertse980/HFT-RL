@@ -28,7 +28,8 @@ optuna-dashboard>=0.15.0            # optional: web UI for HPO results
 # ── Data & market data ──────────────────────────────────────
 numpy>=1.26.0,<2.0                  # pin <2.0 for SB3 compatibility
 pandas>=2.2.0
-yfinance>=0.2.40                    # fallback market data
+pyarrow>=16.0.0                     # parquet read/write for datasets
+yfinance>=0.2.40                    # fallback market data (HK stocks)
 alpaca-py>=0.26.0                   # Alpaca Markets API (US stocks)
 requests>=2.31.0
 websocket-client>=1.7.0

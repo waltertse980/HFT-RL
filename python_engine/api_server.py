@@ -22,6 +22,15 @@ from fastapi import BackgroundTasks, FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
+# Load .env before anything else so ALPACA_API_KEY / ALPACA_API_SECRET are
+# available to os.environ throughout the process lifetime.
+try:
+    from dotenv import load_dotenv
+    _ENV_FILE = Path(__file__).parent / ".env"
+    load_dotenv(dotenv_path=_ENV_FILE, override=False)
+except ImportError:
+    pass  # python-dotenv not installed; env vars must be set in the shell
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger(__name__)
 
@@ -50,6 +59,19 @@ app.add_middleware(
 _jobs: dict[str, dict] = {}
 _job_lock = threading.Lock()
 _paper_stop_event = threading.Event()
+_paper_session: dict[str, Any] = {
+    "running": False,
+    "session_id": None,
+    "ticker": "",
+    "market": "",
+    "model_path": "",
+    "portfolio_value": 0.0,
+    "daily_pnl": 0.0,
+    "position": "FLAT",
+    "entry_price": None,
+    "trade_count": 0,
+    "started_at": None,
+}
 _meta_config: dict[str, Any] = {
     "kelly_fraction": 0.25,
     "regime_override": None,
@@ -169,9 +191,31 @@ def _train_worker(job_id: str, req: TrainRequest) -> None:
     reward = -0.5
 
     # ── Attempt real training ──────────────────────────────────────────────
+    # ── progress callback: writes into _jobs so the UI can poll it ───────
+    def _progress_cb(timestep: int, fraction: float) -> None:
+        with _job_lock:
+            if job_id in _jobs:
+                _jobs[job_id]["progress_pct"] = round(fraction * 100, 1)
+                _jobs[job_id]["status"] = "running"
+
     try:
         import stable_baselines3  # noqa: F401
         from data_pipeline import load_dataset
+
+        # Probe for the tensorflow.io issue before calling train_model so we
+        # get a clean fallback instead of a mid-training crash.
+        try:
+            import tensorflow as _tf
+            _ = _tf.io
+        except Exception as _tf_exc:
+            log.warning(
+                "TensorBoard probe failed (%s) — patching tensorboard_log=None "
+                "in trainer before importing.", _tf_exc
+            )
+            # Monkey-patch the broken tensorboard_log out of SB3's PPO/TD3 init
+            import trainer as _trainer_mod
+            _trainer_mod._TENSORBOARD_OK = False
+
         from trainer import train_model, evaluate_model
 
         data_dict = load_dataset(req.market, req.timescale)
@@ -186,6 +230,7 @@ def _train_worker(job_id: str, req: TrainRequest) -> None:
                 algorithm=req.algo,
                 total_timesteps=req.timesteps,
                 n_envs=4,
+                progress_cb=_progress_cb,                
             )
 
             # Evaluate for meta.json metrics
@@ -769,10 +814,26 @@ async def get_paper_trades(limit: int = 500) -> dict:
 
 @app.post("/paper/start")
 async def paper_start(req: PaperStartRequest, background_tasks: BackgroundTasks) -> dict:
-    global _paper_stop_event
+    global _paper_stop_event, _paper_session
     _paper_stop_event.clear()
+    import datetime
+    session_id = str(uuid.uuid4())
+    _paper_session.update({
+        "running": True,
+        "session_id": session_id,
+        "ticker": req.ticker,
+        "market": req.market,
+        "model_path": req.model_path,
+        "portfolio_value": 0.0,
+        "daily_pnl": 0.0,
+        "position": "FLAT",
+        "entry_price": None,
+        "trade_count": 0,
+        "started_at": datetime.datetime.utcnow().isoformat(),
+    })
 
     def _run() -> None:
+        global _paper_session
         try:
             if req.market.lower() == "us" and req.api_key and req.api_secret:
                 from paper_trader import AlpacaPaperTrader  # type: ignore
@@ -797,14 +858,41 @@ async def paper_start(req: PaperStartRequest, background_tasks: BackgroundTasks)
                 loop.run_until_complete(trader.start())
         except Exception as exc:
             log.error("Paper trader error: %s", exc)
+        finally:
+            _paper_session["running"] = False
 
     background_tasks.add_task(_run)
-    return {"status": "started", "market": req.market, "ticker": req.ticker}
+    return {"status": "started", "session_id": session_id, "market": req.market, "ticker": req.ticker}
+
+
+@app.get("/paper/status")
+async def paper_status() -> dict:
+    """Return current paper trading session state."""
+    session = dict(_paper_session)
+    # Also inject latest trade stats from the trades file
+    if PAPER_TRADES_FILE.exists():
+        lines = [ln for ln in PAPER_TRADES_FILE.read_text().strip().split("\n") if ln]
+        trades = []
+        for ln in lines[-500:]:
+            try:
+                trades.append(json.loads(ln))
+            except Exception:
+                pass
+        if trades:
+            session["trade_count"] = len(trades)
+            last = trades[-1]
+            session["portfolio_value"] = float(last.get("portfolio_value", 0)) or 0.0
+            session["daily_pnl"] = float(last.get("daily_pnl", 0)) or 0.0
+            session["position"] = last.get("position", "FLAT")
+            session["entry_price"] = last.get("entry_price")
+    return session
 
 
 @app.post("/paper/stop")
 async def paper_stop() -> dict:
+    global _paper_session
     _paper_stop_event.set()
+    _paper_session["running"] = False
     return {"status": "stopped"}
 
 
@@ -976,6 +1064,33 @@ def _save_global_config(config: dict) -> None:
     GLOBAL_CONFIG_FILE.write_text(json.dumps(config, indent=2))
 
 
+def _persist_env_keys(api_key: str, api_secret: str, base_url: str) -> None:
+    """
+    Write / update ALPACA_API_KEY, ALPACA_API_SECRET, ALPACA_BASE_URL in
+    python_engine/.env so they are available after a server restart.
+    Also sets them in the current process environment immediately.
+    """
+    env_path = BASE / ".env"
+    # Read existing lines (preserve any other keys)
+    existing: dict[str, str] = {}
+    if env_path.exists():
+        for line in env_path.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if line and not line.startswith("#") and "=" in line:
+                k, _, v = line.partition("=")
+                existing[k.strip()] = v.strip()
+    existing["ALPACA_API_KEY"] = api_key
+    existing["ALPACA_API_SECRET"] = api_secret
+    existing["ALPACA_BASE_URL"] = base_url
+    lines = [f"{k}={v}" for k, v in existing.items()]
+    env_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    # Update running process so data downloads work immediately (no restart needed)
+    os.environ["ALPACA_API_KEY"] = api_key
+    os.environ["ALPACA_API_SECRET"] = api_secret
+    os.environ["ALPACA_BASE_URL"] = base_url
+    log.info("[settings] Alpaca keys persisted to %s and loaded into process env.", env_path)
+
+
 class TestConnectionRequest(BaseModel):
     api_key: str
     api_secret: str
@@ -984,7 +1099,7 @@ class TestConnectionRequest(BaseModel):
 
 @app.post("/settings/test-connection")
 async def test_alpaca_connection(req: TestConnectionRequest):
-    """Test Alpaca API credentials by fetching account info."""
+    """Test Alpaca API credentials and persist them to .env for future use."""
     import httpx
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
@@ -1002,6 +1117,10 @@ async def test_alpaca_connection(req: TestConnectionRequest):
         if not resp.is_success:
             raise HTTPException(status_code=resp.status_code, detail=f"Alpaca API error: {resp.text}")
         account = resp.json()
+
+        # ── Persist keys to .env so they survive server restarts ──────────
+        _persist_env_keys(req.api_key, req.api_secret, req.base_url)
+
         return {
             "connected": True,
             "account_status": account.get("status", "ACTIVE"),
@@ -1038,12 +1157,26 @@ async def save_global_settings(req: GlobalSettingsRequest):
 
 @app.post("/train/{job_id}/stop")
 async def stop_training_job(job_id: str):
-    job = _jobs.get(job_id)
+    with _job_lock:
+        job = _jobs.get(job_id)
     if not job:
-        raise HTTPException(status_code=404, detail=f"Job {job_id} not found")
-    job["status"] = "stopped"
-    job["error_msg"] = "Stopped by user"
+        # Job not in memory (engine was restarted). Return 200 so the UI can
+        # dismiss it cleanly instead of showing a 503 ENGINE_OFFLINE banner.
+        return {"ok": True, "job_id": job_id, "status": "gone",
+                "msg": "Job not found in memory (engine restarted). It has been dismissed."}
+    with _job_lock:
+        job["status"] = "stopped"
+        job["error_msg"] = "Stopped by user"
+        job["completed_at"] = time.time()
     return {"ok": True, "job_id": job_id, "status": "stopped"}
+
+
+@app.delete("/train/{job_id}")
+async def dismiss_training_job(job_id: str):
+    """Remove a job from memory entirely. Works even for orphan / post-restart jobs."""
+    with _job_lock:
+        _jobs.pop(job_id, None)
+    return {"ok": True, "job_id": job_id, "dismissed": True}
 
 
 class EvaluateRequest(BaseModel):
@@ -1154,32 +1287,175 @@ async def download_data(req: DataDownloadRequest, background_tasks: BackgroundTa
         "status": "downloading", "progress_pct": 0, "elapsed_secs": 0, "error_msg": None
     }
 
-    async def _download():
+    def _download_blocking():
+        """
+        Runs entirely in a ThreadPoolExecutor thread so the FastAPI event loop
+        is never blocked by the synchronous Alpaca SDK or pandas operations.
+        Tickers are fetched one-by-one with per-ticker progress updates so the
+        UI stays responsive even for large date ranges (months of 1m bars).
+        """
         import time as _time
         start = _time.time()
         try:
-            from data_pipeline import load_dataset
-            _data_jobs[job_id]["status"] = "downloading"
-            _data_jobs[job_id]["progress_pct"] = 10
-            data = load_dataset(req.market, req.timescale, tickers=req.tickers,
-                                start=req.start_date, end=req.end_date)
+            from data_pipeline import (
+                download_us_data, download_hk_data,
+                aggregate_to_timescale, compute_features,
+            )
+            from alpaca.data.historical import StockHistoricalDataClient
+            from alpaca.data.requests import StockBarsRequest
+            from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
+            from alpaca.data.enums import DataFeed
+            from datetime import datetime as _dt, timedelta as _td
+
+            # ── Step 1: resolve date range & interval ────────────────────
+            fetch_interval = "1m" if req.timescale == "10s" else req.timescale
+
+            if req.end_date:
+                end_dt = _dt.fromisoformat(req.end_date.replace("Z", ""))
+            else:
+                end_dt = _dt.utcnow()
+
+            if req.start_date:
+                start_dt = _dt.fromisoformat(req.start_date.replace("Z", ""))
+            else:
+                period_map = {"1m": "7d", "5m": "60d", "1h": "365d"}
+                default_period = period_map.get(fetch_interval, "7d")
+                days = int(default_period.replace("d", ""))
+                start_dt = end_dt - _td(days=days)
+
+            market = req.market.lower()
+            api_key    = os.environ.get("ALPACA_API_KEY", "")
+            api_secret = os.environ.get("ALPACA_API_SECRET", "")
+
+            log.info(
+                "[data/download] job=%s market=%s tickers=%s interval=%s "
+                "start=%s end=%s",
+                job_id, market, req.tickers, fetch_interval,
+                start_dt.date(), end_dt.date(),
+            )
+
+            tickers = req.tickers
+            total   = len(tickers)
+            raw: dict = {}
+
+            _data_jobs[job_id]["status"]       = "downloading"
+            _data_jobs[job_id]["progress_pct"] = 5
+
+            # ── Step 2: fetch one ticker at a time ───────────────────────
+            for i, ticker in enumerate(tickers):
+                _data_jobs[job_id]["progress_pct"] = 5 + int(45 * i / total)
+                try:
+                    if market == "us" and api_key and api_secret:
+                        # Direct per-ticker Alpaca call (avoids all-or-nothing bulk request)
+                        tf_map = {
+                            "1m": TimeFrame(1, TimeFrameUnit.Minute),
+                            "5m": TimeFrame(5, TimeFrameUnit.Minute),
+                            "1h": TimeFrame(1, TimeFrameUnit.Hour),
+                        }
+                        client = StockHistoricalDataClient(api_key, api_secret)
+                        bars_req = StockBarsRequest(
+                            symbol_or_symbols=[ticker],
+                            timeframe=tf_map.get(fetch_interval, TimeFrame(1, TimeFrameUnit.Minute)),
+                            start=start_dt,
+                            end=end_dt,
+                            feed=DataFeed.IEX,
+                        )
+                        bars = client.get_stock_bars(bars_req)
+                        if not bars.df.empty:
+                            df = bars.df.xs(ticker, level="symbol").copy()
+                            df.rename(columns={
+                                "open": "Open", "high": "High", "low": "Low",
+                                "close": "Close", "volume": "Volume",
+                            }, inplace=True)
+                            df = df[["Open", "High", "Low", "Close", "Volume"]]
+                            raw[ticker] = df
+                            log.info("[data/download] Alpaca %s: %d rows", ticker, len(df))
+                        else:
+                            log.warning("[data/download] Alpaca returned empty for %s", ticker)
+                    else:
+                        # HK or no Alpaca keys — use yfinance
+                        days_delta = max(1, (end_dt - start_dt).days)
+                        df_list = download_hk_data(
+                            tickers=[ticker],
+                            period=f"{days_delta}d",
+                            interval=fetch_interval,
+                        ) if market == "hk" else download_us_data(
+                            tickers=[ticker],
+                            period=f"{days_delta}d",
+                            interval=fetch_interval,
+                        )
+                        if ticker in df_list:
+                            raw[ticker] = df_list[ticker]
+                except Exception as exc_dl:  # noqa: BLE001
+                    log.error("[data/download] download error for %s: %s", ticker, exc_dl)
+
+            _data_jobs[job_id]["progress_pct"] = 50
+
+            if not raw:
+                raise RuntimeError(
+                    f"No data returned for any ticker in {req.tickers}. "
+                    "For US stocks: ensure ALPACA_API_KEY and ALPACA_API_SECRET are "
+                    "set in Settings. For HK stocks: install yfinance."
+                )
+
+            # ── Step 3: feature engineering per ticker ──────────────────
             _data_jobs[job_id]["status"] = "processing"
-            _data_jobs[job_id]["progress_pct"] = 70
-            # Save split datasets
-            for ticker, df in data.items():
-                n = len(df)
-                n_train = int(n * req.train_ratio)  # noqa: F841
-                n_val = int(n * req.val_ratio)  # noqa: F841
-                out_path = DATA_DIR / f"{ticker}_{req.market}_{req.timescale}.parquet"
+            processed: dict = {}
+            fetched_total = len(raw)
+            for j, (ticker, df_raw) in enumerate(raw.items()):
+                _data_jobs[job_id]["progress_pct"] = 50 + int(40 * j / fetched_total)
+                try:
+                    df_resampled = aggregate_to_timescale(df_raw, req.timescale)
+                    df_feat      = compute_features(df_resampled)
+                    processed[ticker] = df_feat
+                    log.info(
+                        "[data/download] %s → %d rows, %d z_ features",
+                        ticker, len(df_feat),
+                        sum(1 for c in df_feat.columns if c.startswith("z_")),
+                    )
+                except Exception as exc_inner:  # noqa: BLE001
+                    log.error("[data/download] feature error for %s: %s", ticker, exc_inner)
+
+            if not processed:
+                raise RuntimeError("Feature engineering produced no valid data for any ticker.")
+
+            # ── Step 4: save per-ticker parquet ─────────────────────────
+            for ticker, df in processed.items():
+                n       = len(df)
+                n_train = int(n * req.train_ratio)
+                n_val   = int(n * req.val_ratio)
+                n_test  = n - n_train - n_val
+                out_path = DATA_DIR / f"{ticker}_{market}_{req.timescale}.parquet"
+                df.attrs["n_train"] = n_train
+                df.attrs["n_val"]   = n_val
+                df.attrs["n_test"]  = n_test
                 df.to_parquet(str(out_path))
-            _data_jobs[job_id]["status"] = "done"
+                log.info(
+                    "[data/download] saved %s → train=%d val=%d test=%d",
+                    out_path.name, n_train, n_val, n_test,
+                )
+
+            _data_jobs[job_id]["status"]       = "done"
             _data_jobs[job_id]["progress_pct"] = 100
             _data_jobs[job_id]["elapsed_secs"] = int(_time.time() - start)
-        except Exception as exc:
-            _data_jobs[job_id]["status"] = "error"
-            _data_jobs[job_id]["error_msg"] = str(exc)
 
-    background_tasks.add_task(_download)
+        except Exception as exc:
+            _data_jobs[job_id]["status"]    = "error"
+            _data_jobs[job_id]["error_msg"] = str(exc)
+            log.error("[data/download] job %s failed: %s", job_id, exc)
+
+    # Run in a thread so the event loop is never blocked by Alpaca SDK / pandas.
+    # BackgroundTasks supports both sync and async callables:
+    # - async def → awaited on the event loop (WRONG for blocking work)
+    # - plain def  → run directly in the calling thread (also blocks if heavy)
+    # Solution: wrap in an async shim that dispatches to a thread via run_in_executor.
+    import asyncio
+
+    async def _dispatch_to_thread():
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(None, _download_blocking)
+
+    background_tasks.add_task(_dispatch_to_thread)
     return {"job_id": job_id, "status": "started"}
 
 

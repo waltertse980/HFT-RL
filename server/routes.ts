@@ -384,14 +384,25 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
 
   app.post('/api/training/stop/:jobId', async (req: Request<ParamsDictionary>, res: Response) => {
     try {
-      const result = await callPython<{ ok: boolean }>(`/train/${req.params.jobId}/stop`, {
+      const result = await callPython<{ ok: boolean; status: string }>(`/train/${req.params.jobId}/stop`, {
         method: 'POST',
       });
-      await storage.updateJob(String(req.params.jobId), { status: 'stopped' });
+      // Python now returns 200 even for gone/orphan jobs — mark stopped locally too
+      try { await storage.updateJob(String(req.params.jobId), { status: 'stopped' }); } catch (_) {}
       res.json(result.data);
     } catch (err) {
-      handleEngineError(res as unknown as Response, err);
+      // If engine is offline, still return 200 so UI can dismiss the stale job
+      res.json({ ok: true, status: 'gone', msg: 'Engine offline — job dismissed locally' });
     }
+  });
+  
+  // Dismiss a job from memory entirely (client-side removal for orphans)
+  app.delete('/api/training/jobs/:jobId', async (req: Request<ParamsDictionary>, res: Response) => {
+    try {
+      await callPython<{ ok: boolean }>(`/train/${req.params.jobId}`, { method: 'DELETE' });
+    } catch (_) { /* ignore if engine offline */ }
+    try { await storage.updateJob(String(req.params.jobId), { status: 'stopped' }); } catch (_) {}
+    res.json({ ok: true, dismissed: true });
   });
 
   app.post(
@@ -441,8 +452,26 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
 
   app.get('/api/backtest/results', async (_req: Request, res: Response) => {
     try {
-      const results = await storage.getAllBacktestResults();
-      res.json(results);
+      const raw = await storage.getAllBacktestResults();
+      // Normalise to match BacktestRun shape expected by frontend
+      const results = raw.map((r) => ({
+        id: r.id,
+        market: r.market,
+        ticker: r.ticker,
+        timescale: r.timescale,
+        model: r.modelPath,
+        startDate: r.startDate,
+        endDate: r.endDate,
+        sharpe: r.sharpeRatio ?? 0,
+        sortino: r.sortinoRatio ?? 0,
+        calmar: r.calmarRatio ?? 0,
+        maxDrawdown: r.maxDrawdownPct ?? 0,
+        totalReturn: r.totalReturnPct ?? 0,
+        winRate: r.winRate ?? 0,
+        nTrades: r.nTrades ?? 0,
+        createdAt: r.createdAt,
+      }));
+      res.json({ results });
     } catch (err) {
       res.status(500).json({ error: String(err) });
     }
@@ -484,7 +513,26 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
         equityCurve: data.equity_curve ? JSON.stringify(data.equity_curve) : null,
         createdAt: new Date().toISOString(),
       } as InsertBacktestResult);
-      res.status(201).json(saved);
+      // Return full BacktestRun shape (including equity_curve + trades from Python)
+      res.status(201).json({
+        id: saved.id,
+        market: saved.market,
+        ticker: saved.ticker,
+        timescale: saved.timescale,
+        model: saved.modelPath,
+        startDate: saved.startDate,
+        endDate: saved.endDate,
+        sharpe: saved.sharpeRatio ?? 0,
+        sortino: saved.sortinoRatio ?? 0,
+        calmar: saved.calmarRatio ?? 0,
+        maxDrawdown: saved.maxDrawdownPct ?? 0,
+        totalReturn: saved.totalReturnPct ?? 0,
+        winRate: saved.winRate ?? 0,
+        nTrades: saved.nTrades ?? 0,
+        createdAt: saved.createdAt,
+        equityCurve: data.equity_curve ?? [],
+        trades: (data.trades as unknown[]) ?? [],
+      });
     } catch (err) {
       handleEngineError(res as unknown as Response, err);
     }
@@ -495,9 +543,29 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     async (req: Request<ParamsDictionary, unknown, unknown, ParsedQs>, res: Response) => {
       try {
         const id = parseInt(String(req.params.id), 10);
-        const result = await storage.getBacktestResultById(id);
-        if (!result) return res.status(404).json({ error: 'Not found' });
-        res.json(result);
+        const r = await storage.getBacktestResultById(id);
+        if (!r) return res.status(404).json({ error: 'Not found' });
+        // Normalise to BacktestRun shape
+        const normalised = {
+          id: r.id,
+          market: r.market,
+          ticker: r.ticker,
+          timescale: r.timescale,
+          model: r.modelPath,
+          startDate: r.startDate,
+          endDate: r.endDate,
+          sharpe: r.sharpeRatio ?? 0,
+          sortino: r.sortinoRatio ?? 0,
+          calmar: r.calmarRatio ?? 0,
+          maxDrawdown: r.maxDrawdownPct ?? 0,
+          totalReturn: r.totalReturnPct ?? 0,
+          winRate: r.winRate ?? 0,
+          nTrades: r.nTrades ?? 0,
+          createdAt: r.createdAt,
+          equityCurve: r.equityCurve ? JSON.parse(r.equityCurve as string) : [],
+          trades: [],  // trade-level data stored by Python engine separately
+        };
+        res.json(normalised);
       } catch (err) {
         res.status(500).json({ error: String(err) });
       }
@@ -565,13 +633,39 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     },
   );
 
+  // GET /api/redteam/results/all — historical red team runs from DB (grouped by backtest)
+  app.get('/api/redteam/results/all', async (_req: Request, res: Response) => {
+    try {
+      const allResults = await storage.getAllRedTeamResults();
+      // Group by backtestId, aggregate pass/total counts
+      // Fetch model name from backtest record when backtestId is set
+      const grouped: Record<string, { date: string; model: string; passed: number; total: number }> = {};
+      for (const r of allResults) {
+        const key = String(r.backtestId ?? r.id);
+        if (!grouped[key]) {
+          // Try to get model name from metrics JSON
+          let model = '';
+          try { const m = JSON.parse(r.metrics); model = m.model_path ?? m.model ?? ''; } catch {}
+          grouped[key] = { date: r.createdAt ?? '', model, passed: 0, total: 0 };
+        }
+        grouped[key].total += 1;
+        if (r.passed) grouped[key].passed += 1;
+      }
+      res.json({ results: Object.values(grouped) });
+    } catch (_err) {
+      // If storage method doesn't exist, return empty
+      res.json({ results: [] });
+    }
+  });
+
   // ── Paper Trading routes ──────────────────────────────────────────────────────
 
   app.get('/api/paper/trades', async (req: Request, res: Response) => {
     try {
       const limit = Math.min(parseInt((req.query.limit as string) || '500', 10), 1000);
       const trades = await storage.getRecentPaperTrades(limit);
-      res.json(trades);
+      // Wrap in {trades:[...]} shape for consistency with Python engine response
+      res.json({ trades: Array.isArray(trades) ? trades : [] });
     } catch (err) {
       res.status(500).json({ error: String(err) });
     }
@@ -626,6 +720,29 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
   app.post('/api/paper/stop', async (_req: Request, res: Response) => {
     try {
       const result = await callPython<{ status: string }>('/paper/stop', { method: 'POST' });
+      res.json(result.data);
+    } catch (err) {
+      handleEngineError(res as unknown as Response, err);
+    }
+  });
+
+  // GET /api/paper/status — real-time session state from Python engine
+  app.get('/api/paper/status', async (_req: Request, res: Response) => {
+    try {
+      const result = await callPython<Record<string, unknown>>('/paper/status');
+      res.json(result.data);
+    } catch (err) {
+      handleEngineError(res as unknown as Response, err);
+    }
+  });
+
+  // GET /api/paper/trades — wraps Python /paper_trades; returns {trades: [...]} shape
+  // (Express already has this but it reads from SQLite — add a Python proxy variant
+  //  at /api/paper/trades/live so the LiveTrading page can switch when needed)
+  app.get('/api/paper/trades/live', async (req: Request, res: Response) => {
+    try {
+      const limit = parseInt((req.query.limit as string) || '500', 10);
+      const result = await callPython<{ trades: unknown[]; count: number }>(`/paper_trades?limit=${limit}`);
       res.json(result.data);
     } catch (err) {
       handleEngineError(res as unknown as Response, err);

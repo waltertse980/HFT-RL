@@ -283,7 +283,11 @@ class HFTradingEnv(gym.Env):
         # No explicit penalty terms — the agent learns to avoid over-trading
         # because each trade reduces V through real transaction costs.
         reward = (self._portfolio_value - prev_portfolio) / self.initial_capital
-
+# Guard against any residual NaN/inf from price data anomalies
+        if not np.isfinite(reward):
+            reward = 0.0
+        reward = float(np.clip(reward, -1.0, 1.0))  # cap at ±100% per step
+        
         # ── Termination ───────────────────────────────────────────────────
         terminated = bool(
             self._portfolio_value < 0.5 * self.initial_capital
@@ -380,7 +384,9 @@ class HFTradingEnv(gym.Env):
             return changes
         actual_invest = shares * price
         cost = self._cost(actual_invest)
-        self._cash -= cost  # short proceeds credited separately via MTM
+        # Short sale: broker credits proceeds to cash, we pay transaction cost.
+        # MTM will then deduct mark-to-market losses as price moves against us.
+        self._cash += actual_invest - cost
         self._shares_held = shares
         self._position    = POSITION_SHORT
         self._entry_price = price

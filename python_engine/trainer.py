@@ -69,6 +69,23 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# TensorBoard is optional — disable if the installed tensorboard/tensorflow
+# package has a broken tensorflow.io shim (common when TF is partially installed).
+_TENSORBOARD_OK = False
+try:
+    import tensorboard  # noqa: F401
+    import tensorflow as tf  # noqa: F401
+    _ = tf.io  # probe the attribute that fails
+    _TENSORBOARD_OK = True
+except Exception:
+    pass
+
+if not _TENSORBOARD_OK:
+    logger.warning(
+        "TensorBoard logging disabled (tensorflow.io unavailable). "
+        "Training will proceed normally without TB logs."
+    )
+
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
@@ -295,7 +312,7 @@ def _build_ppo(
         vf_coef=0.5,
         max_grad_norm=0.5,
         policy_kwargs=policy_kwargs,
-        tensorboard_log=str(LOG_DIR / "ppo_tensorboard"),
+        tensorboard_log=str(LOG_DIR / "ppo_tensorboard") if _TENSORBOARD_OK else None,
         verbose=1,
     )
     logger.info("PPO model created — total_timesteps=%d", total_timesteps)
@@ -330,7 +347,7 @@ def _build_td3(
         gradient_steps=1,
         action_noise=None,
         policy_kwargs=policy_kwargs,
-        tensorboard_log=str(LOG_DIR / "td3_tensorboard"),
+        tensorboard_log=str(LOG_DIR / "td3_tensorboard") if _TENSORBOARD_OK else None,
         verbose=1,
     )
     logger.info("TD3 model created.")
@@ -375,6 +392,7 @@ def train_model(
     Path to the saved final model (.zip).
     """
     algorithm = algorithm.upper()
+    market    = market.lower()   # normalise: 'US' -> 'us', 'HK' -> 'hk'
     if algorithm not in ("PPO", "TD3"):
         raise ValueError(f"Unsupported algorithm '{algorithm}'. Choose PPO or TD3.")
     if timescale not in SUPPORTED_TIMESCALES:
@@ -598,6 +616,7 @@ def export_to_onnx(
     Path to the written ONNX file (may be FP16 or FP32 depending on support).
     """
     algorithm = algorithm.upper()
+    market    = market.lower()   # normalise: 'US' -> 'us', 'HK' -> 'hk'
     output_path_obj = Path(output_path)
     output_path_obj.parent.mkdir(parents=True, exist_ok=True)
 

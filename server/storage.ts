@@ -50,6 +50,7 @@ export interface IStorage {
   deleteBacktestResult(id: number): Promise<void>;
 
   // RedTeamResults
+  getAllRedTeamResults(): Promise<RedTeamResult[]>;
   getRedTeamResultsByBacktestId(backtestId: number): Promise<RedTeamResult[]>;
   createRedTeamResult(data: InsertRedTeamResult): Promise<RedTeamResult>;
 
@@ -155,6 +156,10 @@ export class DatabaseStorage implements IStorage {
   }
 
   // ── RedTeamResults ───────────────────────────────────────────────────────
+
+  async getAllRedTeamResults(): Promise<RedTeamResult[]> {
+    return db.select().from(redTeamResults).all();
+  }
 
   async getRedTeamResultsByBacktestId(backtestId: number): Promise<RedTeamResult[]> {
     return db
