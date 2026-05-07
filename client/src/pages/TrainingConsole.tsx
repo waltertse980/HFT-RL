@@ -457,6 +457,81 @@ export default function TrainingConsole() {
   const [timesteps, setTimesteps] = useState(1_000_000);
   const [tickers, setTickers] = useState("");
 
+  // LOB-HFT v2 strategy switch & state
+  const [strategyType, setStrategyType] = useState<"bar-rl" | "lob-hft">("bar-rl");
+  const LOB_SYMBOLS_DEFAULT = ["NVDA", "AAPL", "TSM", "META"];
+  const [lobSymbols, setLobSymbols] = useState<string[]>(LOB_SYMBOLS_DEFAULT);
+  const [lobNSteps, setLobNSteps] = useState<number>(500_000);
+  const [lobBaselineRunning, setLobBaselineRunning] = useState<boolean>(false);
+  const [lobBaselineResult, setLobBaselineResult] = useState<{
+    accuracy: number;
+    passes_gate: boolean;
+    n_train: number;
+    n_test: number;
+    model_path?: string;
+  } | null>(null);
+  const [lobBaselineError, setLobBaselineError] = useState<string | null>(null);
+  const [lobTrainStarting, setLobTrainStarting] = useState<boolean>(false);
+  const [lobTrainJobId, setLobTrainJobId] = useState<string | null>(null);
+  const [lobTrainError, setLobTrainError] = useState<string | null>(null);
+
+  const toggleLobSymbolTC = (sym: string) => {
+    setLobSymbols((prev) =>
+      prev.includes(sym) ? prev.filter((s) => s !== sym) : [...prev, sym]
+    );
+  };
+
+  const runXgbBaseline = async () => {
+    setLobBaselineError(null);
+    setLobBaselineResult(null);
+    setLobBaselineRunning(true);
+    try {
+      const res = await fetch("/api/training/xgb-baseline", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ symbols: lobSymbols, test_size: 0.2 }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        setLobBaselineError(data?.detail || `HTTP ${res.status}`);
+      } else {
+        setLobBaselineResult(data);
+      }
+    } catch (err) {
+      setLobBaselineError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setLobBaselineRunning(false);
+    }
+  };
+
+  const startLobTraining = async () => {
+    setLobTrainError(null);
+    setLobTrainJobId(null);
+    setLobTrainStarting(true);
+    try {
+      const res = await fetch("/api/training/start-lob", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          symbols: lobSymbols,
+          n_steps: lobNSteps,
+          fee: 0.0001,
+        }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        setLobTrainError(data?.detail || `HTTP ${res.status}`);
+      } else {
+        setLobTrainJobId(data?.job_id ?? null);
+        toast({ title: "LOB PPO training started", description: data?.job_id });
+      }
+    } catch (err) {
+      setLobTrainError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setLobTrainStarting(false);
+    }
+  };
+
   // Track which jobs went offline (engine dropped during poll)
   const [offlineJobIds, setOfflineJobIds] = useState<Set<string>>(new Set());
 
@@ -740,6 +815,141 @@ export default function TrainingConsole() {
       <div className="flex-1 overflow-y-auto p-4 space-y-4">
         {/* Engine Offline Banner */}
         {engineOffline && <EngineOfflineBanner />}
+
+        {/* Strategy type toggle */}
+        <div className="flex gap-2" data-testid="strategy-toggle-train">
+          <Button
+            variant={strategyType === "bar-rl" ? "default" : "outline"}
+            size="sm"
+            onClick={() => setStrategyType("bar-rl")}
+            data-testid="btn-train-strategy-bar-rl"
+          >
+            Bar-RL v1 (OHLCV)
+          </Button>
+          <Button
+            variant={strategyType === "lob-hft" ? "default" : "outline"}
+            size="sm"
+            onClick={() => setStrategyType("lob-hft")}
+            data-testid="btn-train-strategy-lob-hft"
+          >
+            LOB-HFT v2 (Order Book)
+          </Button>
+        </div>
+
+        {strategyType === "lob-hft" && (
+          <Card className="bg-card border-border" data-testid="card-lob-training">
+            <CardContent className="p-4 space-y-4">
+              <div className="space-y-2">
+                <label className="text-xs text-muted-foreground font-sans">Symbols</label>
+                <div className="flex flex-wrap gap-3">
+                  {LOB_SYMBOLS_DEFAULT.map((sym) => (
+                    <label
+                      key={sym}
+                      className="flex items-center gap-2 text-xs font-mono cursor-pointer"
+                    >
+                      <input
+                        type="checkbox"
+                        checked={lobSymbols.includes(sym)}
+                        onChange={() => toggleLobSymbolTC(sym)}
+                        data-testid={`chk-train-lob-${sym}`}
+                      />
+                      {sym}
+                    </label>
+                  ))}
+                </div>
+              </div>
+
+              {/* Step 1: XGBoost baseline gate */}
+              <div className="p-3 rounded-md border border-border bg-muted/30 space-y-2">
+                <div className="flex items-center justify-between">
+                  <span className="text-xs font-sans font-semibold">
+                    Step 1: XGBoost Baseline (Gate Check)
+                  </span>
+                  <Button
+                    size="sm"
+                    onClick={runXgbBaseline}
+                    disabled={lobBaselineRunning || lobSymbols.length === 0}
+                    data-testid="btn-run-xgb-baseline"
+                  >
+                    {lobBaselineRunning ? "Running..." : "Run Baseline"}
+                  </Button>
+                </div>
+                {lobBaselineResult && (
+                  <div
+                    className={`p-2 rounded-md text-xs font-mono border ${
+                      lobBaselineResult.passes_gate
+                        ? "border-emerald-500/40 bg-emerald-500/10 text-emerald-300"
+                        : "border-red-500/40 bg-red-500/10 text-red-300"
+                    }`}
+                    data-testid="xgb-baseline-result"
+                  >
+                    accuracy = {lobBaselineResult.accuracy.toFixed(4)} · gate{" "}
+                    {lobBaselineResult.passes_gate ? "PASS" : "FAIL"} · train n={
+                      lobBaselineResult.n_train
+                    }{" "}
+                    · test n={lobBaselineResult.n_test}
+                  </div>
+                )}
+                {lobBaselineError && (
+                  <div className="p-2 rounded-md text-xs font-mono border border-red-500/40 bg-red-500/10 text-red-300">
+                    {lobBaselineError}
+                  </div>
+                )}
+                <p className="text-[11px] text-muted-foreground font-sans">
+                  PPO training is unlocked when accuracy &gt; 0.36.
+                </p>
+              </div>
+
+              {/* Step 2: PPO training */}
+              <div className="p-3 rounded-md border border-border bg-muted/30 space-y-2">
+                <div className="flex items-center justify-between gap-3">
+                  <span className="text-xs font-sans font-semibold">
+                    Step 2: Train LOB PPO
+                  </span>
+                  <div className="flex items-center gap-2">
+                    <label className="text-xs text-muted-foreground font-sans">n_steps</label>
+                    <input
+                      type="number"
+                      value={lobNSteps}
+                      onChange={(e) => setLobNSteps(Number(e.target.value))}
+                      min={10_000}
+                      max={5_000_000}
+                      step={50_000}
+                      className="h-7 w-28 text-xs font-mono bg-muted border border-border rounded px-2"
+                      data-testid="input-lob-nsteps"
+                    />
+                    <Button
+                      size="sm"
+                      onClick={startLobTraining}
+                      disabled={
+                        lobTrainStarting ||
+                        !lobBaselineResult ||
+                        !lobBaselineResult.passes_gate ||
+                        lobSymbols.length === 0
+                      }
+                      data-testid="btn-start-lob-training"
+                    >
+                      {lobTrainStarting ? "Starting..." : "Start Training"}
+                    </Button>
+                  </div>
+                </div>
+                {lobTrainJobId && (
+                  <div
+                    className="p-2 rounded-md text-xs font-mono border border-emerald-500/40 bg-emerald-500/10 text-emerald-300"
+                    data-testid="lob-train-job"
+                  >
+                    Job started: {lobTrainJobId}
+                  </div>
+                )}
+                {lobTrainError && (
+                  <div className="p-2 rounded-md text-xs font-mono border border-red-500/40 bg-red-500/10 text-red-300">
+                    {lobTrainError}
+                  </div>
+                )}
+              </div>
+            </CardContent>
+          </Card>
+        )}
 
         {/* Config Card */}
         <Card className="bg-card border-border">

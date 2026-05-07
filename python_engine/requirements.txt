@@ -66,3 +66,18 @@ psutil>=5.9.0                       # system resource monitoring
 # pytest-asyncio>=0.23.0
 # black>=24.4.0
 # ruff>=0.4.0
+
+# ── LOB-HFT v2 additions ─────────────────────────────────────
+# Install after activating .venv:
+#   pip install databento sortedcontainers scikit-learn xgboost polars joblib
+#   pip install numba          (or: conda install numba  if pip fails on Windows)
+#   pip install hftbacktest    (optional; Rust-backed — requires MSVC build tools)
+databento>=0.40.0
+sortedcontainers>=2.4.0
+scikit-learn>=1.5.0
+xgboost>=2.0.0
+polars>=0.20.0
+joblib>=1.4.0
+numba>=0.59.0                  # optional but strongly recommended for lob_reconstructor speed
+# hftbacktest>=2.4.0           # optional; Rust/Numba backend — may require MSVC on Windows
+                               # enable by removing the leading '#' after confirming Rust is installed

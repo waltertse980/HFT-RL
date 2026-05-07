@@ -1071,8 +1071,21 @@ def _persist_env_keys(api_key: str, api_secret: str, base_url: str) -> None:
     python_engine/.env so they are available after a server restart.
     Also sets them in the current process environment immediately.
     """
+    _write_env_key("ALPACA_API_KEY", api_key)
+    _write_env_key("ALPACA_API_SECRET", api_secret)
+    _write_env_key("ALPACA_BASE_URL", base_url)
+    os.environ["ALPACA_API_KEY"] = api_key
+    os.environ["ALPACA_API_SECRET"] = api_secret
+    os.environ["ALPACA_BASE_URL"] = base_url
+    log.info("[settings] Alpaca keys persisted and loaded into process env.")
+
+
+def _write_env_key(key: str, value: str) -> None:
+    """
+    Generic single-key writer: upserts KEY=value in python_engine/.env.
+    Preserves all other existing keys.  Safe to call from multiple code paths.
+    """
     env_path = BASE / ".env"
-    # Read existing lines (preserve any other keys)
     existing: dict[str, str] = {}
     if env_path.exists():
         for line in env_path.read_text(encoding="utf-8").splitlines():
@@ -1080,16 +1093,10 @@ def _persist_env_keys(api_key: str, api_secret: str, base_url: str) -> None:
             if line and not line.startswith("#") and "=" in line:
                 k, _, v = line.partition("=")
                 existing[k.strip()] = v.strip()
-    existing["ALPACA_API_KEY"] = api_key
-    existing["ALPACA_API_SECRET"] = api_secret
-    existing["ALPACA_BASE_URL"] = base_url
-    lines = [f"{k}={v}" for k, v in existing.items()]
-    env_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
-    # Update running process so data downloads work immediately (no restart needed)
-    os.environ["ALPACA_API_KEY"] = api_key
-    os.environ["ALPACA_API_SECRET"] = api_secret
-    os.environ["ALPACA_BASE_URL"] = base_url
-    log.info("[settings] Alpaca keys persisted to %s and loaded into process env.", env_path)
+    existing[key] = value
+    env_path.write_text("\n".join(f"{k}={v}" for k, v in existing.items()) + "\n", encoding="utf-8")
+    os.environ[key] = value
+    log.info("[settings] %s persisted to %s", key, env_path)
 
 
 class TestConnectionRequest(BaseModel):
@@ -1153,8 +1160,101 @@ async def save_global_settings(req: GlobalSettingsRequest):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Databento settings endpoint  (Phase 1)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class DatabentoSettingsRequest(BaseModel):
+    api_key: str
+
+
+@app.post("/settings/databento")
+async def save_databento_settings(req: DatabentoSettingsRequest):
+    """
+    Persist the Databento API key to python_engine/.env and validate it
+    by hitting the Databento metadata endpoint.
+
+    The key is saved as DATABENTO_API_KEY in .env and loaded into the
+    running process immediately — no server restart required.
+    """
+    import httpx
+
+    _write_env_key("DATABENTO_API_KEY", req.api_key)
+
+    # Validate against Databento API (lightweight metadata call)
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.get(
+                "https://hist.databento.com/v0/metadata.list_datasets",
+                auth=(req.api_key, ""),  # Databento uses API key as HTTP Basic username
+            )
+        if resp.status_code == 401:
+            raise HTTPException(status_code=401, detail="Invalid Databento API key")
+        if not resp.is_success:
+            raise HTTPException(
+                status_code=resp.status_code,
+                detail=f"Databento API error: {resp.text[:200]}",
+            )
+        datasets = resp.json()
+        return {
+            "connected": True,
+            "available_datasets": datasets if isinstance(datasets, list) else [],
+            "message": "Databento API key validated and saved.",
+        }
+    except httpx.TimeoutException:
+        raise HTTPException(status_code=504, detail="Databento API connection timed out")
+    except httpx.ConnectError:
+        raise HTTPException(status_code=503, detail="Cannot reach Databento API")
+
+
+@app.get("/settings/databento")
+async def get_databento_settings():
+    """Return whether a Databento API key is currently configured (never returns the key itself)."""
+    key = os.environ.get("DATABENTO_API_KEY", "")
+    return {
+        "configured": bool(key),
+        "key_preview": (key[:4] + "****" + key[-4:]) if len(key) >= 8 else ("****" if key else ""),
+    }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Additional training endpoints
 # ─────────────────────────────────────────────────────────────────────────────
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Checkpoint re-evaluation endpoint  (Phase 0)
+# ─────────────────────────────────────────────────────────────────────────────
+
+@app.post("/training/evaluate/checkpoint/{checkpoint_dir}")
+async def re_evaluate_checkpoint(checkpoint_dir: str):
+    """
+    Re-score a saved Bar-RL v1 checkpoint with the corrected metrics logic.
+
+    Loads   checkpoints/<checkpoint_dir>/ppo_final.zip  +  vecnorm.pkl
+    Runs on the 10 % held-out test split of the original training data.
+    Overwrites checkpoints/<checkpoint_dir>/meta.json with corrected metrics.
+
+    Example::
+        POST /training/evaluate/checkpoint/ppo_us_1m_1778004783
+    """
+    import asyncio
+    try:
+        from trainer import _evaluate_saved_model
+    except ImportError as exc:
+        raise HTTPException(status_code=503, detail=f"trainer not importable: {exc}")
+
+    try:
+        loop = asyncio.get_running_loop()
+        result = await loop.run_in_executor(None, _evaluate_saved_model, checkpoint_dir)
+        return result
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    except RuntimeError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+    except Exception as exc:
+        import traceback as _tb
+        log.error("re_evaluate_checkpoint failed: %s\n%s", exc, _tb.format_exc())
+        raise HTTPException(status_code=500, detail=str(exc))
+
 
 @app.post("/train/{job_id}/stop")
 async def stop_training_job(job_id: str):
@@ -1536,6 +1636,266 @@ async def preview_dataset(ticker: str = "AAPL", market: str = "us", timescale: s
             "ann_volatility": round(ann_vol, 4),
         }
     }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# LOB data download endpoint  (Phase 2)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class LOBDownloadRequest(BaseModel):
+    symbols: list[str] = ["NVDA", "AAPL", "TSM", "META"]
+    start: str = "2026-04-28"
+    end: str = "2026-05-02"
+
+
+_lob_data_jobs: dict = {}
+
+
+@app.post("/data/download-lob")
+async def download_lob_data(req: LOBDownloadRequest, background_tasks: BackgroundTasks):
+    """
+    Downloads Databento MBO (Level 3) data for the given symbols and date range,
+    then reconstructs LOB feature snapshots and saves them as Parquet files.
+
+    Requires DATABENTO_API_KEY to be set via POST /settings/databento first.
+    """
+    job_id = str(uuid.uuid4())
+    _lob_data_jobs[job_id] = {
+        "job_id": job_id,
+        "symbols": req.symbols,
+        "start": req.start,
+        "end": req.end,
+        "status": "downloading",
+        "progress_pct": 0,
+        "feature_files": [],
+        "error_msg": None,
+    }
+
+    def _run_lob_download():
+        import time as _time
+        try:
+            import sys, os as _os
+            sys.path.insert(0, str(BASE / "hft_lob"))
+            from databento_pipeline import download_mbo
+            from lob_reconstructor import reconstruct_and_save
+
+            _lob_data_jobs[job_id]["status"] = "downloading"
+            files = download_mbo(req.symbols, req.start, req.end)
+            _lob_data_jobs[job_id]["progress_pct"] = 50
+
+            feature_files = []
+            for i, filepath in enumerate(files):
+                _lob_data_jobs[job_id]["progress_pct"] = 50 + int(45 * i / max(len(files), 1))
+                symbol = _os.path.basename(filepath).split("_")[0]
+                out = reconstruct_and_save(filepath, symbol)
+                feature_files.append(out)
+
+            _lob_data_jobs[job_id]["status"] = "done"
+            _lob_data_jobs[job_id]["progress_pct"] = 100
+            _lob_data_jobs[job_id]["feature_files"] = feature_files
+        except Exception as exc:
+            import traceback as _tb
+            log.error("[download-lob] job %s failed: %s\n%s", job_id, exc, _tb.format_exc())
+            _lob_data_jobs[job_id]["status"] = "error"
+            _lob_data_jobs[job_id]["error_msg"] = str(exc)
+
+    import asyncio
+    async def _dispatch():
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(None, _run_lob_download)
+
+    background_tasks.add_task(_dispatch)
+    return {"job_id": job_id, "status": "started"}
+
+
+@app.get("/data/lob-jobs")
+async def get_lob_data_jobs():
+    return {"jobs": list(_lob_data_jobs.values())}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# XGBoost supervised baseline endpoint  (Phase 3)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class XGBBaselineRequest(BaseModel):
+    symbols: list[str] = ["NVDA", "AAPL", "TSM", "META"]
+    test_size: float = 0.2
+
+
+@app.post("/training/xgb-baseline")
+async def train_xgb_baseline_endpoint(req: XGBBaselineRequest):
+    """
+    Trains XGBoost supervised baseline on LOB features to predict mid-price direction.
+    This is the GATE CHECK before LOB PPO training.
+    Returns accuracy — must be > 0.36 to proceed to PPO.
+    """
+    import asyncio
+    import sys
+    sys.path.insert(0, str(BASE / "hft_lob"))
+    try:
+        from train_xgb_baseline import train_baseline
+    except ImportError as exc:
+        raise HTTPException(status_code=503, detail=f"XGBoost baseline not available: {exc}")
+    loop = asyncio.get_running_loop()
+    try:
+        result = await loop.run_in_executor(None, train_baseline, req.symbols, req.test_size)
+        return result
+    except Exception as exc:
+        import traceback as _tb
+        log.error("/training/xgb-baseline failed: %s\n%s", exc, _tb.format_exc())
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# LOB backtest endpoint  (Phase 5)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class LOBBacktestRequest(BaseModel):
+    model_path: str
+    vecnorm_path: Optional[str] = None
+    symbols: list[str] = ["NVDA", "AAPL", "TSM", "META"]
+    fee: float = 0.0001
+
+
+@app.post("/backtest/lob")
+async def backtest_lob(req: LOBBacktestRequest):
+    """
+    Runs event-driven LOB backtest on a saved LOB PPO model.
+    """
+    import asyncio, sys
+    sys.path.insert(0, str(BASE / "hft_lob"))
+    try:
+        from lob_backtester import run_lob_backtest
+    except ImportError as exc:
+        raise HTTPException(status_code=503, detail=f"LOB backtester not available: {exc}")
+    loop = asyncio.get_running_loop()
+    try:
+        result = await loop.run_in_executor(
+            None, run_lob_backtest,
+            req.model_path, req.vecnorm_path or "", req.symbols, req.fee
+        )
+        return result
+    except Exception as exc:
+        import traceback as _tb
+        log.error("/backtest/lob failed: %s\n%s", exc, _tb.format_exc())
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# LOB PPO training endpoint  (Phase 6)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class LOBTrainRequest(BaseModel):
+    symbols: list[str] = ["NVDA", "AAPL", "TSM", "META"]
+    n_steps: int = Field(default=500_000, ge=10_000, le=5_000_000)
+    fee: float = 0.0001
+
+
+@app.post("/training/start-lob")
+async def start_lob_training(req: LOBTrainRequest, background_tasks: BackgroundTasks):
+    """
+    Starts LOB PPO training in the background.
+    Requires Phase 3 XGBoost gate to be passed first (accuracy > 36%).
+    """
+    job_id = str(uuid.uuid4())
+    with _job_lock:
+        _jobs[job_id] = {
+            "job_id": job_id,
+            "type": "lob_ppo_train",
+            "symbols": req.symbols,
+            "status": "pending",
+            "progress_pct": 0.0,
+            "model_path": None,
+            "error_msg": None,
+            "started_at": None,
+            "completed_at": None,
+            "created_at": time.time(),
+        }
+
+    def _run_lob_train():
+        with _job_lock:
+            _jobs[job_id]["status"] = "running"
+            _jobs[job_id]["started_at"] = time.time()
+        try:
+            from trainer import train_lob_ppo
+            result = train_lob_ppo(req.symbols, req.n_steps, req.fee)
+            with _job_lock:
+                _jobs[job_id]["status"] = "done"
+                _jobs[job_id]["model_path"] = result.get("checkpoint_dir")
+                _jobs[job_id]["completed_at"] = time.time()
+                _jobs[job_id]["progress_pct"] = 100.0
+        except Exception as exc:
+            import traceback as _tb
+            log.error("LOB PPO training job %s failed: %s\n%s", job_id, exc, _tb.format_exc())
+            with _job_lock:
+                _jobs[job_id]["status"] = "error"
+                _jobs[job_id]["error_msg"] = str(exc)
+                _jobs[job_id]["completed_at"] = time.time()
+
+    background_tasks.add_task(_run_lob_train)
+    return {"job_id": job_id, "status": "started"}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# LOB paper trading endpoints  (Phase 9)
+# ─────────────────────────────────────────────────────────────────────────────
+
+_lob_paper_session: dict = {"running": False, "session_id": None, "symbols": [], "checkpoint_dir": ""}
+_lob_paper_stop_event = threading.Event()
+
+
+class LOBPaperStartRequest(BaseModel):
+    checkpoint_dir: str
+    symbols: list[str] = ["NVDA", "AAPL", "TSM", "META"]
+    qty_per_trade: int = 10
+    max_daily_loss: float = -500.0
+
+
+@app.post("/paper/start-lob")
+async def paper_start_lob(req: LOBPaperStartRequest, background_tasks: BackgroundTasks):
+    """Start the LOB paper trading loop."""
+    global _lob_paper_session, _lob_paper_stop_event
+    _lob_paper_stop_event.clear()
+    session_id = str(uuid.uuid4())
+    _lob_paper_session.update({
+        "running": True,
+        "session_id": session_id,
+        "symbols": req.symbols,
+        "checkpoint_dir": req.checkpoint_dir,
+    })
+
+    def _run():
+        import asyncio, sys
+        sys.path.insert(0, str(BASE / "hft_lob"))
+        try:
+            from paper_trader_lob import LOBPaperTrader
+            trader = LOBPaperTrader(
+                checkpoint_dir=req.checkpoint_dir,
+                symbols=req.symbols,
+                qty_per_trade=req.qty_per_trade,
+                max_daily_loss=req.max_daily_loss,
+            )
+            loop = asyncio.new_event_loop()
+            loop.run_until_complete(trader.start())
+        except Exception as exc:
+            log.error("LOB paper trader error: %s", exc)
+        finally:
+            _lob_paper_session["running"] = False
+
+    background_tasks.add_task(_run)
+    return {"status": "started", "session_id": session_id, "symbols": req.symbols}
+
+
+@app.get("/paper/status-lob")
+async def paper_status_lob():
+    return dict(_lob_paper_session)
+
+
+@app.post("/paper/stop-lob")
+async def paper_stop_lob():
+    _lob_paper_stop_event.set()
+    _lob_paper_session["running"] = False
+    return {"status": "stopped"}
 
 
 # ─────────────────────────────────────────────────────────────────────────────

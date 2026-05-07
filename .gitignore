@@ -1,14 +1,3 @@
-# SQLite database files and local runtime files 
-# —— never commit; exposes demo data at rest
-data.db
-data.db-shm
-data.db-wal
-data.db-journal
-*.db
-python_engine/data/
-python_engine/logs/
-python_engine/models/
-
 # secrets
 .env
 .env.*
@@ -28,13 +17,28 @@ __pycache__/
 *.pyo
 *.pyd
 
-# build output
-dist/
+# SQLite database files & local runtime files — never commit; exposes demo data at rest
+data.db
+data.db-shm
+data.db-wal
+data.db-journal
+*.db
+python_engine/data/
+python_engine/logs/
+python_engine/models/
 
 # model / training outputs
 python_engine/checkpoints/
 python_engine/global_config.json
 
+# build output
+dist/
+
+.vite/
 *.log
 .DS_Store
-.vite/
+
+
+
+
+

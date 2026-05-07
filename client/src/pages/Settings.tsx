@@ -637,6 +637,42 @@ export default function Settings() {
   const [initialCapital, setInitialCapital] = useState<number>(100000);
   const [engineOfflineGlobal, setEngineOfflineGlobal] = useState(false);
 
+  // Databento (LOB-HFT v2)
+  const [databentoKey, setDatabentoKey] = useState<string>("");
+  const [databentoConfigured, setDatabentoConfigured] = useState<boolean>(false);
+  const [savingDatabento, setSavingDatabento] = useState<boolean>(false);
+  const [databentoStatus, setDatabentoStatus] = useState<{ ok: boolean; msg: string } | null>(null);
+
+  const saveDatabentoKey = async () => {
+    if (!databentoKey.trim()) {
+      setDatabentoStatus({ ok: false, msg: "API key is empty." });
+      return;
+    }
+    setSavingDatabento(true);
+    setDatabentoStatus(null);
+    try {
+      const res = await fetch("/api/databento", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ api_key: databentoKey }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        setDatabentoStatus({ ok: false, msg: data?.detail || `HTTP ${res.status}` });
+        setDatabentoConfigured(false);
+      } else {
+        setDatabentoStatus({ ok: true, msg: "Databento API key saved." });
+        setDatabentoConfigured(true);
+        toast({ title: "Databento API key saved" });
+      }
+    } catch (err) {
+      setDatabentoStatus({ ok: false, msg: err instanceof Error ? err.message : String(err) });
+      setDatabentoConfigured(false);
+    } finally {
+      setSavingDatabento(false);
+    }
+  };
+
   // ── Queries ─────────────────────────────────────────────────────────────────
 
   const { data: settingsData, isLoading: settingsLoading } = useQuery({
@@ -948,6 +984,75 @@ export default function Settings() {
                   </TabsContent>
                 </Tabs>
               )}
+            </CardContent>
+          </Card>
+
+          {/* Databento API Key (LOB-HFT v2) */}
+          <Card className="bg-card border-border" data-testid="card-databento">
+            <CardHeader className="py-3 px-4 border-b border-border">
+              <CardTitle className="text-sm font-sans font-medium text-foreground flex items-center gap-2">
+                Databento API Key
+                <Badge
+                  variant="outline"
+                  className="text-[10px] border-blue-500/40 text-blue-400 bg-blue-500/10"
+                >
+                  LOB-HFT v2
+                </Badge>
+              </CardTitle>
+            </CardHeader>
+            <CardContent className="p-4 space-y-3">
+              <p className="text-xs text-muted-foreground font-sans">
+                Required for downloading Level-3 (MBO) order-book data used by the LOB-HFT v2
+                strategy. Get a key at{" "}
+                <span className="text-primary font-mono">databento.com</span>.
+              </p>
+              <div className="space-y-2">
+                <Label className="text-xs font-sans text-muted-foreground">API Key</Label>
+                <SecretInput
+                  value={databentoKey}
+                  onChange={setDatabentoKey}
+                  placeholder="db-••••••••••••••••••••••••••••"
+                  testId="input-databento-key"
+                />
+              </div>
+              <Button
+                data-testid="btn-save-databento"
+                variant="outline"
+                size="sm"
+                className="h-8 text-xs border-border bg-muted hover:bg-accent w-full"
+                onClick={saveDatabentoKey}
+                disabled={savingDatabento}
+              >
+                {savingDatabento ? (
+                  <>
+                    <RefreshCw size={12} className="mr-1.5 animate-spin" />
+                    Saving...
+                  </>
+                ) : (
+                  <>
+                    <Save size={12} className="mr-1.5" />
+                    Save & Validate
+                  </>
+                )}
+              </Button>
+              {databentoStatus && (
+                <div
+                  className={`p-2 rounded-md text-xs font-mono border ${
+                    databentoStatus.ok
+                      ? "border-emerald-500/40 bg-emerald-500/10 text-emerald-300"
+                      : "border-red-500/40 bg-red-500/10 text-red-300"
+                  }`}
+                  data-testid="databento-status"
+                >
+                  {databentoStatus.msg}
+                </div>
+              )}
+              <p className="text-xs text-muted-foreground font-sans">
+                Status:{" "}
+                <span className={databentoConfigured ? "text-emerald-400" : "text-muted-foreground"}>
+                  {databentoConfigured ? "Configured" : "Not configured"}
+                </span>
+              </p>
             </CardContent>
           </Card>
 

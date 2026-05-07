@@ -320,7 +320,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
           })
       );
       void liveUpdates; // fire-and-wait, ignore individual failures
-      
+
       const refreshed = await storage.getAllJobs();
       res.json(refreshed);
     } catch (err) {

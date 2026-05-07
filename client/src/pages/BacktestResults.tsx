@@ -47,6 +47,8 @@ export interface BacktestRun {
   totalReturn: number;
   winRate: number;
   nTrades: number;
+  // Optional LOB-HFT v2 metric — share of steps spent holding a non-flat position.
+  position_ratio?: number;
   equityCurve: { date: string; value: number; drawdown?: number }[];
   trades: BacktestTrade[];
   createdAt: string;
@@ -509,6 +511,21 @@ export default function BacktestResults() {
                     </p>
                   </CardContent>
                 </Card>
+                {typeof result.position_ratio === "number" && (
+                  <Card className="bg-card border-border" data-testid="metric-position-ratio">
+                    <CardContent className="p-4">
+                      <p className="text-xs text-muted-foreground font-sans uppercase tracking-wide mb-1">
+                        Position Ratio
+                      </p>
+                      <p className="text-2xl font-mono font-semibold text-foreground">
+                        {(result.position_ratio * 100).toFixed(1)}%
+                      </p>
+                      <p className="text-xs text-muted-foreground font-sans mt-1">
+                        Time in market (LOB-HFT v2)
+                      </p>
+                    </CardContent>
+                  </Card>
+                )}
               </div>
 
               {/* Equity Curve */}

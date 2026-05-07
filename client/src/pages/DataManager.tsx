@@ -179,6 +179,79 @@ function statusLabel(status: DataJob["status"]): string {
 
 export default function DataManager() {
   // ── Config state
+  // LOB-HFT v2 strategy switch
+  const [strategyType, setStrategyType] = useState<"bar-rl" | "lob-hft">("bar-rl");
+  const LOB_SYMBOLS = ["NVDA", "AAPL", "TSM", "META"];
+  const [lobSymbols, setLobSymbols] = useState<string[]>(["NVDA", "AAPL", "TSM", "META"]);
+  const [lobStart, setLobStart] = useState<string>("2026-04-28");
+  const [lobEnd, setLobEnd] = useState<string>("2026-05-02");
+  const [lobJobs, setLobJobs] = useState<
+    {
+      job_id: string;
+      symbols: string[];
+      start: string;
+      end: string;
+      status: string;
+      progress_pct: number;
+      feature_files: string[];
+      error_msg: string | null;
+    }[]
+  >([]);
+  const [lobDownloading, setLobDownloading] = useState<boolean>(false);
+  const [lobError, setLobError] = useState<string | null>(null);
+
+  const toggleLobSymbol = (sym: string) => {
+    setLobSymbols((prev) =>
+      prev.includes(sym) ? prev.filter((s) => s !== sym) : [...prev, sym]
+    );
+  };
+
+  const startLobDownload = async () => {
+    setLobError(null);
+    setLobDownloading(true);
+    try {
+      const res = await fetch("/api/data/download-lob", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          symbols: lobSymbols,
+          start: lobStart,
+          end: lobEnd,
+        }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        setLobError(data?.detail || `HTTP ${res.status}`);
+      }
+    } catch (err) {
+      setLobError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setLobDownloading(false);
+    }
+  };
+
+  // Poll LOB jobs while in LOB-HFT mode
+  useEffect(() => {
+    if (strategyType !== "lob-hft") return;
+    let cancelled = false;
+    const fetchJobs = async () => {
+      try {
+        const res = await fetch("/api/data/lob-jobs");
+        if (!res.ok) return;
+        const data = await res.json();
+        if (!cancelled && Array.isArray(data?.jobs)) setLobJobs(data.jobs);
+      } catch {
+        /* ignore */
+      }
+    };
+    fetchJobs();
+    const iv = setInterval(fetchJobs, 3000);
+    return () => {
+      cancelled = true;
+      clearInterval(iv);
+    };
+  }, [strategyType]);
+
   const [market, setMarket] = useState<"us" | "hk">("us");
   const [tickerInput, setTickerInput] = useState("AAPL, NVDA, META");
   const [timescale, setTimescale] = useState("1m");
@@ -405,6 +478,133 @@ export default function DataManager() {
         </Badge>
       </div>
 
+      {/* Strategy type toggle */}
+      <div className="flex gap-2 mb-4" data-testid="strategy-toggle">
+        <Button
+          variant={strategyType === "bar-rl" ? "default" : "outline"}
+          size="sm"
+          onClick={() => setStrategyType("bar-rl")}
+          data-testid="btn-strategy-bar-rl"
+        >
+          Bar-RL v1 (OHLCV)
+        </Button>
+        <Button
+          variant={strategyType === "lob-hft" ? "default" : "outline"}
+          size="sm"
+          onClick={() => setStrategyType("lob-hft")}
+          data-testid="btn-strategy-lob-hft"
+        >
+          LOB-HFT v2 (Order Book)
+        </Button>
+      </div>
+
+      {strategyType === "lob-hft" && (
+        <Card className="bg-card border border-border" data-testid="card-lob-download">
+          <CardHeader className="pb-3">
+            <CardTitle className="text-sm font-semibold flex items-center gap-2">
+              <Download className="w-4 h-4 text-primary" />
+              LOB Data Download (Databento MBO)
+            </CardTitle>
+          </CardHeader>
+          <CardContent className="space-y-4">
+            <div className="space-y-2">
+              <Label className="text-xs font-sans text-muted-foreground">Symbols</Label>
+              <div className="flex flex-wrap gap-3">
+                {LOB_SYMBOLS.map((sym) => (
+                  <label
+                    key={sym}
+                    className="flex items-center gap-2 text-xs font-mono cursor-pointer"
+                  >
+                    <input
+                      type="checkbox"
+                      checked={lobSymbols.includes(sym)}
+                      onChange={() => toggleLobSymbol(sym)}
+                      data-testid={`chk-lob-${sym}`}
+                    />
+                    {sym}
+                  </label>
+                ))}
+              </div>
+            </div>
+            <div className="grid grid-cols-2 gap-3">
+              <div className="space-y-1.5">
+                <Label className="text-xs font-sans text-muted-foreground">Start Date</Label>
+                <Input
+                  type="date"
+                  value={lobStart}
+                  onChange={(e) => setLobStart(e.target.value)}
+                  className="h-8 text-xs font-mono"
+                  data-testid="input-lob-start"
+                />
+              </div>
+              <div className="space-y-1.5">
+                <Label className="text-xs font-sans text-muted-foreground">End Date</Label>
+                <Input
+                  type="date"
+                  value={lobEnd}
+                  onChange={(e) => setLobEnd(e.target.value)}
+                  className="h-8 text-xs font-mono"
+                  data-testid="input-lob-end"
+                />
+              </div>
+            </div>
+            <Button
+              onClick={startLobDownload}
+              disabled={lobDownloading || lobSymbols.length === 0}
+              size="sm"
+              className="w-full h-9 text-xs"
+              data-testid="btn-download-lob"
+            >
+              <Download size={14} className="mr-1.5" />
+              {lobDownloading ? "Submitting..." : "Download LOB Data"}
+            </Button>
+            {lobError && (
+              <div className="p-2 rounded-md text-xs font-mono border border-red-500/40 bg-red-500/10 text-red-300">
+                {lobError}
+              </div>
+            )}
+            <div className="space-y-2" data-testid="lob-job-list">
+              <Label className="text-xs font-sans text-muted-foreground">Recent Jobs</Label>
+              {lobJobs.length === 0 ? (
+                <p className="text-xs text-muted-foreground font-sans">No LOB jobs yet.</p>
+              ) : (
+                lobJobs.map((j) => (
+                  <div
+                    key={j.job_id}
+                    className="p-2 rounded-md border border-border/60 bg-muted/40 space-y-1"
+                  >
+                    <div className="flex items-center justify-between text-xs font-mono">
+                      <span>{j.symbols.join(", ")}</span>
+                      <span
+                        className={
+                          j.status === "done"
+                            ? "text-emerald-400"
+                            : j.status === "error"
+                              ? "text-red-400"
+                              : "text-yellow-400"
+                        }
+                      >
+                        {j.status} ({j.progress_pct}%)
+                      </span>
+                    </div>
+                    <Progress value={j.progress_pct} className="h-1" />
+                    <div className="text-[10px] text-muted-foreground font-mono">
+                      {j.start} → {j.end}
+                      {j.feature_files.length > 0 &&
+                        ` · ${j.feature_files.length} parquet file(s)`}
+                    </div>
+                    {j.error_msg && (
+                      <div className="text-[10px] text-red-400 font-mono">{j.error_msg}</div>
+                    )}
+                  </div>
+                ))
+              )}
+            </div>
+          </CardContent>
+        </Card>
+      )}
+
+      {strategyType === "bar-rl" && (<>
       {/* 3-column grid */}
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
         {/* ── Left: Config ──────────────────────────────────────────────── */}
@@ -919,6 +1119,7 @@ export default function DataManager() {
           </CardContent>
         </Card>
       )}
+      </>)}
     </div>
   );
 }

@@ -283,11 +283,11 @@ class HFTradingEnv(gym.Env):
         # No explicit penalty terms — the agent learns to avoid over-trading
         # because each trade reduces V through real transaction costs.
         reward = (self._portfolio_value - prev_portfolio) / self.initial_capital
-# Guard against any residual NaN/inf from price data anomalies
+        # Guard against any residual NaN/inf from price data anomalies
         if not np.isfinite(reward):
             reward = 0.0
         reward = float(np.clip(reward, -1.0, 1.0))  # cap at ±100% per step
-        
+
         # ── Termination ───────────────────────────────────────────────────
         terminated = bool(
             self._portfolio_value < 0.5 * self.initial_capital

@@ -1057,5 +1057,291 @@ def main() -> None:
                     )
 
 
+# ---------------------------------------------------------------------------
+# LOB-HFT v2 PPO trainer  (Phase 6)
+# ---------------------------------------------------------------------------
+
+CHECKPOINTS_LOB: Path = BASE_DIR / "checkpoints_lob"
+CHECKPOINTS_LOB.mkdir(parents=True, exist_ok=True)
+
+
+def train_lob_ppo(
+    symbols: list[str],
+    n_steps: int = 500_000,
+    fee: float = 0.0001,
+) -> dict:
+    """
+    Train a PPO agent on the LOB feature stack written by Phase 2-3.
+
+    Always uses DummyVecEnv (Windows-safe) and device="cpu" for the MLP
+    policy. VecNormalize statistics are persisted as ``vecnorm.pkl``
+    next to the saved model.
+    """
+    import sys as _sys
+    import time as _time
+    import json as _json
+
+    from stable_baselines3 import PPO
+    from stable_baselines3.common.callbacks import (
+        CheckpointCallback,
+        EvalCallback,
+    )
+    from stable_baselines3.common.monitor import Monitor
+    from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
+
+    # Make hft_lob importable as flat modules
+    _sys.path.insert(0, str(Path(__file__).parent / "hft_lob"))
+    from lob_features import load_feature_df, add_rolling_features  # type: ignore
+    from lob_environment import LOBTradingEnv  # type: ignore
+
+    df = load_feature_df(symbols)
+    if df.empty:
+        raise RuntimeError(
+            f"No LOB feature parquet files for symbols={symbols}. "
+            "Run /data/download-lob first."
+        )
+    df = add_rolling_features(df)
+
+    # 70 / 15 / 15 split — chronological
+    n = len(df)
+    n_train = int(n * 0.70)
+    n_val   = int(n * 0.15)
+    train_df = df.iloc[:n_train].reset_index(drop=True)
+    val_df   = df.iloc[n_train:n_train + n_val].reset_index(drop=True)
+    if train_df.empty or val_df.empty:
+        raise RuntimeError("LOB dataset too small for train/val split.")
+
+    run_id = f"lob_ppo_{int(_time.time())}"
+    out_dir = CHECKPOINTS_LOB / run_id
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    def _make_train_env():
+        return Monitor(LOBTradingEnv(train_df, fee=fee))
+
+    def _make_val_env():
+        return Monitor(LOBTradingEnv(val_df, fee=fee))
+
+    train_env = DummyVecEnv([_make_train_env])
+    train_env = VecNormalize(
+        train_env, norm_obs=True, norm_reward=True, clip_obs=10.0
+    )
+
+    val_env = DummyVecEnv([_make_val_env])
+    val_env = VecNormalize(
+        val_env, norm_obs=True, norm_reward=False,
+        clip_obs=10.0, training=False,
+    )
+    val_env.obs_rms = train_env.obs_rms
+    val_env.ret_rms = train_env.ret_rms
+
+    model = PPO(
+        "MlpPolicy",
+        train_env,
+        learning_rate=3e-4,
+        n_steps=2048,
+        batch_size=256,
+        gamma=0.999,
+        gae_lambda=0.95,
+        clip_range=0.2,
+        ent_coef=0.01,
+        verbose=1,
+        device="cpu",
+        tensorboard_log=None,
+    )
+
+    eval_cb = EvalCallback(
+        val_env,
+        best_model_save_path=str(out_dir),
+        log_path=str(out_dir),
+        eval_freq=max(n_steps // 20, 5_000),
+        n_eval_episodes=2,
+        deterministic=True,
+        callback_after_eval=StopTrainingOnNoModelImprovement(
+            max_no_improvement_evals=5, min_evals=3
+        ),
+        verbose=1,
+    )
+    ckpt_cb = CheckpointCallback(
+        save_freq=max(n_steps // 10, 10_000),
+        save_path=str(out_dir),
+        name_prefix="ppo_lob",
+    )
+
+    logger.info(
+        "[train_lob_ppo] starting run %s symbols=%s n_steps=%d fee=%s train=%d val=%d",
+        run_id, symbols, n_steps, fee, len(train_df), len(val_df),
+    )
+    t0 = _time.time()
+    model.learn(total_timesteps=int(n_steps), callback=[ckpt_cb, eval_cb])
+    train_secs = _time.time() - t0
+
+    model_path = out_dir / "ppo_final.zip"
+    model.save(str(model_path))
+    train_env.save(str(out_dir / "vecnorm.pkl"))
+
+    meta = {
+        "run_id": run_id,
+        "symbols": symbols,
+        "n_steps": int(n_steps),
+        "fee": float(fee),
+        "train_seconds": round(train_secs, 2),
+        "train_rows": int(len(train_df)),
+        "val_rows": int(len(val_df)),
+        "model_path": str(model_path),
+        "vecnorm_path": str(out_dir / "vecnorm.pkl"),
+        "created_at": int(_time.time()),
+        "strategy": "lob-hft-v2",
+    }
+    (out_dir / "meta.json").write_text(_json.dumps(meta, indent=2), encoding="utf-8")
+
+    logger.info("[train_lob_ppo] done run=%s in %.1fs", run_id, train_secs)
+    return {
+        "checkpoint_dir": run_id,
+        "model_path": str(model_path),
+        "vecnorm_path": str(out_dir / "vecnorm.pkl"),
+        "train_seconds": round(train_secs, 2),
+        "meta": meta,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Standalone checkpoint re-evaluator  (Phase 0)
+# ---------------------------------------------------------------------------
+
+
+def _evaluate_saved_model(checkpoint_dir: str) -> dict:
+    """
+    Re-evaluate a saved Bar-RL v1 checkpoint using the corrected metrics logic.
+
+    Loads ppo_final.zip + vecnorm.pkl from
+        python_engine/checkpoints/<checkpoint_dir>/
+    runs inference on the 10 % held-out test split of the original training
+    data, then OVERWRITES meta.json with the corrected metrics.
+
+    Parameters
+    ----------
+    checkpoint_dir : str
+        Name of the checkpoint sub-directory, e.g.
+        ``'ppo_us_1m_1778004783'``.  Must exist under CHECKPOINT_DIR.
+
+    Returns
+    -------
+    dict  with keys ``status``, ``checkpoint``, ``metrics``.
+    """
+    import json as _json
+    import time as _time
+    import tempfile
+
+    ckpt_path   = CHECKPOINT_DIR / checkpoint_dir
+    model_path  = ckpt_path / "ppo_final.zip"
+    vecnorm_path = ckpt_path / "vecnorm.pkl"
+    meta_path   = ckpt_path / "meta.json"
+
+    # ── Validate paths ────────────────────────────────────────────────────
+    if not ckpt_path.exists():
+        raise FileNotFoundError(f"Checkpoint directory not found: {ckpt_path}")
+    if not model_path.exists():
+        raise FileNotFoundError(f"Model file not found: {model_path}")
+    if not meta_path.exists():
+        raise FileNotFoundError(f"meta.json not found: {meta_path}")
+
+    # ── Load existing meta to recover training context ────────────────────
+    meta: dict = _json.loads(meta_path.read_text(encoding="utf-8"))
+    tickers  = meta.get("tickers") or []
+    market   = str(meta.get("market",   "us")).lower()
+    timescale = str(meta.get("timescale", "1m"))
+    algorithm = str(meta.get("algo",     "PPO")).upper()
+
+    logger.info(
+        "[_evaluate_saved_model] checkpoint=%s market=%s timescale=%s algo=%s tickers=%s",
+        checkpoint_dir, market, timescale, algorithm, tickers,
+    )
+
+    # ── Load dataset — same call as api_server.py uses ────────────────────
+    # load_dataset(market, timescale) returns dict[ticker, raw_OHLCV_df]
+    data_dict = load_dataset(market, timescale)  # type: ignore[call-arg]
+    if not data_dict:
+        raise RuntimeError(
+            f"No data found for market={market} timescale={timescale}. "
+            "Run a data download first."
+        )
+
+    # Prefer tickers that were used during training; fall back to first available
+    primary_ticker = None
+    for t in (tickers or []):
+        if t in data_dict:
+            primary_ticker = t
+            break
+    if primary_ticker is None:
+        primary_ticker = next(iter(data_dict))
+        logger.warning(
+            "[_evaluate_saved_model] None of the training tickers %s found in "
+            "dataset; falling back to '%s'",
+            tickers, primary_ticker,
+        )
+
+    # ── Feature engineering + split (mirrors _train_worker) ──────────────
+    from data_pipeline import compute_features  # local import — avoids circular at module level
+    raw_df     = data_dict[primary_ticker]
+    featured   = compute_features(raw_df)
+    _, _, test_df = split_data(featured, 0.6, 0.3, 0.1)
+
+    logger.info(
+        "[_evaluate_saved_model] test_df shape=%s ticker=%s",
+        test_df.shape, primary_ticker,
+    )
+
+    # ── Run evaluation with corrected metrics ─────────────────────────────
+    vn_path: Optional[str] = str(vecnorm_path) if vecnorm_path.exists() else None
+    metrics = evaluate_model(
+        model_path  = str(model_path),
+        test_data   = test_df,
+        algorithm   = algorithm,
+        market      = market,
+        timescale   = timescale,
+        vecnorm_path = vn_path,
+    )
+
+    # ── Atomically overwrite meta.json ────────────────────────────────────
+    corrected: dict = {
+        "sharpe":           metrics["sharpe"],
+        "max_drawdown":     metrics["max_drawdown"],
+        "win_rate":         metrics["win_rate"],
+        "total_return":     metrics["total_return"],
+        "n_trades":         metrics["n_trades"],
+        "avg_pnl_per_trade": metrics["avg_pnl_per_trade"],
+        "evaluated_at":     int(_time.time()),
+        "evaluation_episodes": DEFAULT_N_EVAL_EPISODES,
+        "evaluated_on":     "test_split_only",
+        "evaluator_version": "v2_corrected",
+    }
+    meta["metrics"] = corrected
+    # Also write top-level keys so the dashboard can read them directly
+    meta["sharpe"]           = corrected["sharpe"]
+    meta["max_drawdown"]     = corrected["max_drawdown"]
+    meta["win_rate"]         = corrected["win_rate"]
+    meta["final_reward"]     = corrected["total_return"]
+    meta["n_trades"]         = corrected["n_trades"]
+    meta["avg_pnl_per_trade"] = corrected["avg_pnl_per_trade"]
+    meta["re_evaluated_at"]  = int(_time.time())
+
+    # Write to a temp file first, then rename — atomic on POSIX; best-effort on Windows
+    tmp = meta_path.with_suffix(".tmp")
+    tmp.write_text(_json.dumps(meta, indent=2), encoding="utf-8")
+    tmp.replace(meta_path)
+
+    logger.info(
+        "[_evaluate_saved_model] meta.json updated: sharpe=%.4f max_dd=%.4f "
+        "win_rate=%.4f total_return=%.4f n_trades=%d avg_pnl=%.4f",
+        corrected["sharpe"], corrected["max_drawdown"], corrected["win_rate"],
+        corrected["total_return"], corrected["n_trades"], corrected["avg_pnl_per_trade"],
+    )
+    return {
+        "status":     "ok",
+        "checkpoint": checkpoint_dir,
+        "metrics":    corrected,
+    }
+
+
 if __name__ == "__main__":
     main()
