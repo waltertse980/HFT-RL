@@ -1978,10 +1978,11 @@ async def council_start(req: CouncilStartRequest, background_tasks: BackgroundTa
                     else:
                         log.warning("Featured file not found: %s — skipping %s %s", fpath, sym, tf)
 
-            if not featured_data or not any(
-                featured_data[s].get("1m") is not None and not featured_data[s]["1m"].empty
-                for s in featured_data
-            ):
+            def _has_1m(sym):
+                df = featured_data[sym].get("1m")
+                return df is not None and len(df) > 0
+
+            if not featured_data or not any(_has_1m(s) for s in featured_data):
                 raise RuntimeError(
                     "No featured 1m data found. Run data download + feature engineering first."
                 )
