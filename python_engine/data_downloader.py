@@ -24,6 +24,13 @@ from typing import Iterable
 
 import pandas as pd
 
+# Load credentials from python_engine/.env before anything else
+try:
+    from dotenv import load_dotenv
+    load_dotenv(Path(__file__).parent / ".env")
+except ImportError:
+    pass  # python-dotenv not installed — fall back to raw env vars
+
 try:
     from alpaca.data.historical import StockHistoricalDataClient
     from alpaca.data.requests import StockBarsRequest

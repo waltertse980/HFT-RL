@@ -154,9 +154,11 @@ def split_by_dates(
     val_mask   = _np.array([(train_end_d < d <= val_end_d) for d in dates])
     test_mask  = _np.array([d > val_end_d for d in dates])
 
-    train_df = df.iloc[train_mask].copy()
-    val_df   = df.iloc[val_mask].copy()
-    test_df  = df.iloc[test_mask].copy()
+    # Use boolean indexing (df[mask]) not iloc[mask] — iloc with a bool array
+    # triggers "The truth value of a DataFrame is ambiguous" on pandas ≥1.5.
+    train_df = df[train_mask].copy()
+    val_df   = df[val_mask].copy()
+    test_df  = df[test_mask].copy()
 
     print(f"[split_by_dates] train={len(train_df):,}  val={len(val_df):,}  test={len(test_df):,}")
     return train_df, val_df, test_df
