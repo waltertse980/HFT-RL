@@ -1899,6 +1899,151 @@ async def paper_stop_lob():
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# 5-Model Council Training endpoints
+# ─────────────────────────────────────────────────────────────────────────────
+
+import threading as _threading
+try:
+    from config import CouncilConfig
+except Exception as _cfg_exc:  # pragma: no cover
+    CouncilConfig = None  # type: ignore
+    log.warning("CouncilConfig import failed (%s) — council endpoints will be disabled at runtime", _cfg_exc)
+
+_council_stop_event = _threading.Event()
+_council_status: dict = {
+    "running": False,
+    "phase": None,
+    "cycle": 0,
+    "total_steps": 0,
+    "elo": {},
+    "leader": None,
+    "sharpe": {},
+    "shaping_alpha": {},
+    "error": None,
+    "elo_history": [],
+    "trade_journals": {},
+}
+_council_thread: Optional[_threading.Thread] = None
+
+
+class CouncilStartRequest(BaseModel):
+    symbols: list[str] = ["TSLA", "NVDA", "AAPL"]
+    primary_timeframe: str = "1m"
+    warmup_steps: int = 100_000
+    total_steps: int = 1_000_000
+    eval_every_k_steps: int = 5_000
+
+
+@app.post("/council/start")
+async def council_start(req: CouncilStartRequest, background_tasks: BackgroundTasks):
+    """Start council training in a background thread."""
+    global _council_thread, _council_status
+    if _council_status.get("running"):
+        raise HTTPException(status_code=409, detail="Council training already running")
+    if CouncilConfig is None:
+        raise HTTPException(status_code=500, detail="CouncilConfig unavailable on server")
+
+    _council_stop_event.clear()
+    _council_status.clear()
+    _council_status.update({
+        "running": True, "phase": "warmup", "cycle": 0, "total_steps": 0,
+        "elo": {}, "leader": None, "sharpe": {}, "shaping_alpha": {},
+        "error": None, "elo_history": [], "trade_journals": {},
+    })
+
+    def _run():
+        import sys
+        sys.path.insert(0, str(BASE))
+        try:
+            from council.council_trainer import start_council_training
+
+            cfg = CouncilConfig(
+                symbols=req.symbols,
+                primary_timeframe=req.primary_timeframe,
+                warmup_steps=req.warmup_steps,
+                total_steps=req.total_steps,
+                eval_every_k_steps=req.eval_every_k_steps,
+            )
+
+            # Load featured data
+            bars_dir = BASE / cfg.bars_dir
+            featured_data: dict = {}
+            for sym in req.symbols:
+                featured_data[sym] = {}
+                for tf in cfg.timeframes:
+                    fpath = bars_dir / f"{sym}_{tf}_featured.parquet"
+                    if fpath.exists():
+                        import pandas as _pd
+                        featured_data[sym][tf] = _pd.read_parquet(fpath)
+                    else:
+                        log.warning("Featured file not found: %s — skipping %s %s", fpath, sym, tf)
+
+            if not featured_data or not any(
+                featured_data[s].get("1m") is not None and not featured_data[s]["1m"].empty
+                for s in featured_data
+            ):
+                raise RuntimeError(
+                    "No featured 1m data found. Run data download + feature engineering first."
+                )
+
+            start_council_training(cfg, featured_data, _council_stop_event, _council_status)
+
+        except Exception as exc:
+            import traceback as _tb
+            log.error("Council training failed: %s\n%s", exc, _tb.format_exc())
+            _council_status["error"] = str(exc)
+        finally:
+            _council_status["running"] = False
+
+    background_tasks.add_task(_run)
+    return {"status": "started", "symbols": req.symbols}
+
+
+@app.post("/council/stop")
+async def council_stop():
+    """Signal the council training loop to stop at the next eval cycle."""
+    _council_stop_event.set()
+    _council_status["running"] = False
+    return {"status": "stopping"}
+
+
+@app.get("/council/status")
+async def council_status():
+    """Current phase, step count, Elo ratings, leader model."""
+    # Strip large fields from the default status payload — clients can hit
+    # /council/elo-history and /council/trade-journals/{id} for the heavy stuff.
+    out = {k: v for k, v in _council_status.items() if k not in ("elo_history", "trade_journals")}
+    return out
+
+
+@app.get("/council/elo-history")
+async def council_elo_history():
+    """Elo rating history for charting — list of {cycle, ratings, timestamp} dicts."""
+    return {"history": _council_status.get("elo_history", [])}
+
+
+@app.get("/council/trade-journals/{model_id}")
+async def council_trade_journals(model_id: str, n: int = 100):
+    """Recent trade journal entries for a given model (A, B, C, D, E)."""
+    journals = _council_status.get("trade_journals", {})
+    if model_id not in journals:
+        raise HTTPException(status_code=404, detail=f"No journal found for model '{model_id}'")
+    return {"model_id": model_id, "entries": journals[model_id][-n:]}
+
+
+@app.get("/council/eval-results")
+async def council_eval_results():
+    """Latest validation Sharpe for all 5 models."""
+    return {
+        "cycle": _council_status.get("cycle", 0),
+        "sharpe": _council_status.get("sharpe", {}),
+        "elo": _council_status.get("elo", {}),
+        "leader": _council_status.get("leader"),
+        "phase": _council_status.get("phase"),
+    }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Entry point
 # ─────────────────────────────────────────────────────────────────────────────
 

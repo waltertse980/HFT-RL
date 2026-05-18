@@ -116,6 +116,52 @@ def split_ticker(ticker: str, market: str, timescale: str,
     return splits
 
 
+def split_by_dates(
+    df: pd.DataFrame,
+    train_end: str = "2026-03-20",
+    val_end: str = "2026-04-28",
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """
+    Fixed-date temporal split for the council intraday training.
+
+    Split boundaries (council spec):
+        Train      2026-01-01 → 2026-03-20   (~57 trading days)
+        Validation 2026-03-21 → 2026-04-28   (~28 trading days)
+        Test       2026-04-29 → 2026-05-18   (~14 trading days)
+
+    Parameters
+    ----------
+    df        : DataFrame with a DatetimeIndex (timezone-aware or naive).
+    train_end : Last date of the training set (inclusive).
+    val_end   : Last date of the validation set (inclusive).
+
+    Returns
+    -------
+    (train_df, val_df, test_df) — no shuffling, strict forward-in-time order.
+    """
+    idx = df.index
+    # Normalise to date for comparison (handles timezone-aware indices)
+    if hasattr(idx, 'tz') and idx.tz is not None:
+        dates = idx.tz_convert('America/New_York').date
+    else:
+        dates = pd.DatetimeIndex(idx).date
+
+    import numpy as _np
+    train_end_d = pd.Timestamp(train_end).date()
+    val_end_d   = pd.Timestamp(val_end).date()
+
+    train_mask = _np.array([d <= train_end_d for d in dates])
+    val_mask   = _np.array([(train_end_d < d <= val_end_d) for d in dates])
+    test_mask  = _np.array([d > val_end_d for d in dates])
+
+    train_df = df.iloc[train_mask].copy()
+    val_df   = df.iloc[val_mask].copy()
+    test_df  = df.iloc[test_mask].copy()
+
+    print(f"[split_by_dates] train={len(train_df):,}  val={len(val_df):,}  test={len(test_df):,}")
+    return train_df, val_df, test_df
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="60/30/10 temporal data split")
     parser.add_argument("--ticker",    required=True, help="e.g. NVDA, AAPL, META")

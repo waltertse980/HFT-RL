@@ -81,3 +81,7 @@ joblib>=1.4.0
 numba>=0.59.0                  # optional but strongly recommended for lob_reconstructor speed
 # hftbacktest>=2.4.0           # optional; Rust/Numba backend — may require MSVC on Windows
                                # enable by removing the leading '#' after confirming Rust is installed
+
+# ── Council intraday training (no new deps — all already included above) ──
+# ta-lib is optional for candlestick patterns — pure-pandas implementation used instead
+# pandas-ta>=0.3.14b  # alternative if ta-lib fails to compile on Windows
